@@ -1,0 +1,17 @@
+
+ Готовые векторные модели (Координаты / SVG)
+
+1. https://github.com/sjvasquez/handwriting-synthesis
+Демо: https://www.calligrapher.ai/
+	• База: Python / TensorFlow v1 (Именно этот код лежит в основе Calligrapher.ai).
+	• Что выдает: Готовые .svg файлы с плавными векторными линиями. Идеально для CoreXY.
+	• Статус: Есть предобученные веса с несколькими стилями почерка.
+2. https://github.com/otuva/handwriting-synthesis (TF2 Migration)
+	• База: TensorFlow 2.x.
+	• Зачем нужен: Тот же проект Васкеса, но адаптированный под современный стек Python 3 и TF2, чтобы не мучиться со старыми библиотеками.
+3. https://github.com/X-rayLaser/pytorch-handwriting-synthesis-toolkit
+	• База: PyTorch.
+	• Плюсы: Инструментарий на PyTorch, включает пайплайны генерации, предобученные модели и возможность экспорта в ONNX для быстрого инференса на бэкенде.
+4. https://github.com/qateralong/HandWriter
+	• Что это: Проект для Marlin/3D-принтеров и плоттеров.
+	• Зачем изучить: Показывает, как реализовать алгоритмы случайного дрожания человеческой руки (organic jitter) и калибровку нажима пера при экспорте в G-code/SVG.
