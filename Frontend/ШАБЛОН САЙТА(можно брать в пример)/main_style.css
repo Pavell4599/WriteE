@@ -1,0 +1,102 @@
+
+.UP_PHOTO {
+    display: block;
+    margin-top: 50px;
+    margin-bottom: 30px;
+    margin-left: auto;      
+    margin-right: 130px;    
+    width: 500px; 
+    aspect-ratio: 1 / 1; 
+    position: relative; 
+}
+
+.UP_PHOTO .rounded-image, 
+.UP_PHOTO .circle_1, 
+.UP_PHOTO .circle_2, 
+.UP_PHOTO .circle_3 {
+    position: absolute;
+    inset: 0; 
+    margin: auto; 
+}
+
+.UP_PHOTO .rounded-image {
+    border-radius: 50%;
+    aspect-ratio: 1 / 1;
+    width: 60%; 
+    object-fit: cover; 
+    z-index: 4; 
+}
+
+.UP_PHOTO .circle_1 {
+    border-radius: 50%;
+    aspect-ratio: 1 / 1;
+    width: 70%; 
+    background-color: rgb(50, 0, 231);
+    z-index: 3; 
+}
+
+.UP_PHOTO .circle_2 {
+    border-radius: 50%;
+    aspect-ratio: 1 / 1;
+    width: 80%; 
+    background-color: rgb(255, 102, 0);
+    z-index: 2; 
+}
+
+.UP_PHOTO .circle_3 {
+    border-radius: 50%;
+    aspect-ratio: 1 / 1;
+    width: 90%; 
+    background-color: rgb(9, 255, 0);
+    z-index: 1; 
+}
+
+.tb {
+    display: block;
+    border: 12px solid #ffe600;
+    border-radius: 24px;
+    background-color: rgb(255, 0, 140);;
+}
+
+.photo {
+    padding: 10px;
+    font-family: 'Unbounded', sans-serif;
+    font-weight: 700;     
+    font-size: 30px;
+    text-align: center;
+    color: rgb(255, 255, 255);
+    width: 600px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+    margin-right: 60px; 
+    margin-left: auto;
+    margin-top: -25px;
+    
+}
+
+.service {
+    padding: 10px;
+    font-family: 'Unbounded', sans-serif;
+    font-weight: 700;     
+    font-size: 45px;
+    text-align: center;
+    color: rgb(255, 255, 255);
+    width: 850px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+    margin-left: 100px; 
+    margin-right: auto;
+    margin-top: -550px;
+    
+}
+
+.contacts {
+    padding: 10px;
+    font-family: 'Unbounded', sans-serif;
+    font-weight: 700;     
+    font-size: 45px;
+    text-align: center;
+    color: rgb(255, 255, 255);
+    width: 100%;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+    margin-top: 30px; 
+
+}
