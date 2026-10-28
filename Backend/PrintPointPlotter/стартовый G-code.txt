@@ -1,0 +1,123 @@
+;===== machine: A1 (PLOTTER ABSOLUTE FIX) ===
+;===== based on: 20260513 ==================
+G392 S0 ; отключаем датчик забития сопла
+M412 S0 ; отключаем датчик наличия филамента
+M620.3 W0 ; отключаем датчик запутывания филамента
+M9833.2
+
+;===== ОТКЛЮЧАЕМ НАГРЕВ (вместо 140/250 градусов) =====
+M1002 gcode_claim_action : 2
+M104 S0 ; сопло НЕ греем
+M140 S0 ; стол НЕ греем
+
+;===== start printer sound ==================
+M17
+M400 S1
+M1006 S1
+M1006 A0 B10 L100 C37 D10 M60 E37 F10 N60
+M1006 A0 B10 L100 C41 D10 M60 E41 F10 N60
+M1006 A0 B10 L100 C44 D10 M60 E44 F10 N60
+M1006 A0 B10 L100 C0 D10 M60 E0 F10 N60
+M1006 A43 B10 L100 C46 D10 M70 E39 F10 N80
+M1006 A0 B10 L100 C0 D10 M60 E0 F10 N80
+M1006 A0 B10 L100 C43 D10 M60 E39 F10 N80
+M1006 A0 B10 L100 C0 D10 M60 E0 F10 N80
+M1006 A0 B10 L100 C41 D10 M80 E41 F10 N60
+M1006 A0 B10 L100 C44 D10 M80 E44 F10 N80
+M1006 A0 B10 L100 C49 D10 M80 E49 F10 N80
+M1006 A0 B10 L100 C0 D10 M80 E0 F10 N80
+M1006 A44 B10 L100 C48 D10 M60 E39 F10 N80
+M1006 A0 B10 L100 C0 D10 M60 E0 F10 N80
+M1006 A0 B10 L100 C44 D10 M80 E39 F10 N80
+M1006 A0 B10 L100 C0 D10 M60 E0 F10 N80
+M1006 A43 B10 L100 C46 D10 M60 E39 F10 N80
+M1006 W
+M18 
+;===== start printer sound ==================
+
+;===== avoid end stop =======================
+G91
+G380 S2 Z40 F1200
+G380 S3 Z-15 F1200
+G90
+
+;===== reset machine status =================
+M204 S6000
+M630 S0 P0
+G91
+M17 Z0.3 ; lower the z-motor current
+G90
+M17 X0.65 Y1.2 Z0.6 ; reset motor current to default
+M960 S5 P1 ; turn on logo lamp
+G90
+M220 S100 ; Reset Feedrate
+M221 S0 ; ВАЖНО: Ставим поток (Flowrate) на 0%, чтобы экструдер не давил пластик
+M73.2 R1.0 ; Reset left time magnitude
+
+;====== cog noise reduction =================
+M982.2 S1 ; turn on cog noise reduction
+
+;===== ПАРКОВКА И ПОИСК НУЛЯ Z (БЕЗ РУЧКИ!) =
+M1002 gcode_claim_action : 13
+G28 X ; паркуем X и Y
+G91
+G1 Z5 F1200
+G90
+G0 X128 Y128 F20000 ; едем в центр стола
+G28 Z P0 ; определяем 0 по Z касанием ХОЛОДНОГО сопла о стол
+G90
+G1 Z5 F1200
+
+;===== КАЛИБРОВКА СЕТКИ СТОЛА (если включена галочка Bed Leveling) =====
+M1002 judge_flag g29_before_print_flag
+G90
+G1 Z5 F1200
+G1 X0 Y0 F30000
+G29.2 S1 ; turn on ABL
+M106 S0 ; turn off fan
+M622 J1
+    M1002 gcode_claim_action : 1
+    G29 A1 X{first_layer_print_min[0]} Y{first_layer_print_min[1]} I{first_layer_print_size[0]} J{first_layer_print_size[1]}
+    M400
+    M500 ; save cali data
+M623
+
+;===== ФИНАЛЬНАЯ ТОЧНАЯ ПРИВЯЗКА Z ==========
+G90
+G1 Z5 F1200
+G1 X108.000 Y-0.500 F30000
+G1 Z0.300 F1200
+M400
+G2814 Z0.32 ; родная точная калибровка высоты A1
+
+;===== ПОДЪЕМ И ОЖИДАНИЕ ДЛЯ УСТАНОВКИ РУЧКИ ===
+M1002 gcode_claim_action : 0
+G90
+G0 Z0.2 F3000 ; поднимаем голову на 0.2 мм вверх
+G0 X128 Y200 F10000 ; ставим голову по центру над столом
+M400 ; ждем полной остановки моторов
+
+M117 Insert Pen Now! ; сообщение на экран
+G4 S30 ; ждем 30 секунд, пока ты закрепляешь ручку
+
+;===== ФИКСАЦИЯ ВЫСОТЫ 4 ММ БЕЗ СБРОСОВ ===
+G90
+G29.2 S0 ; отключаем автоуровень, чтобы он не сбрасывал высоту
+G0 Z4.0 F3000 ; ПРИНУДИТЕЛЬНО поднимаем голову ровно на 4 мм над бумагой
+
+{if curr_bed_type=="Textured PEI Plate"}
+G29.1 Z{-0.02} ; for Textured PEI Plate
+{endif}
+
+M960 S1 P0 ; turn off laser
+M960 S2 P0 ; turn off laser
+M106 S0 ; turn off fan
+M106 P2 S0 ; turn off big fan
+M106 P3 S0 ; turn off chamber fan
+
+M975 S1 ; turn on mech mode supression
+G90
+M83
+M211 X0 Y0 Z0 ; turn off soft endstop
+M1007 S1 ; turn on mass estimation
+; (Команда G29.4 удалена, теперь принтер не вернет ноль обратно на стол)
