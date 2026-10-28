@@ -1,0 +1,8 @@
+
+(Created with svg2gcode_grbl)
+(https://github.com/arcadeperfect/svg2gcode_grbl)
+
+
+(forked from svg2gcode by visphat)
+(https://github.com/vishpat/svg2gcode)
+
