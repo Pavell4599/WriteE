@@ -14,10 +14,12 @@ shape_postamble = "(shape postamble)"
 #shape_postamble = "Z100)"
 
 """Print bed width in mm"""
-bed_max_x = 200
+bed_max_x = 300
 
 """Print bed height in mm"""
-bed_max_y = 280
+bed_max_y = 350
+placement_x = 0.5
+placement_y = 0.5
 
 """ 
 Used to control the smoothness/sharpness of the curves.
@@ -33,8 +35,16 @@ zTravel = 4
 """ height that the z axis will use to draw """
 zDraw = 0
 
-""" feed rate """
-feed_rate = 80000
+"""conservative commissioning feed rate in millimeters per minute"""
+feed_rate = 300
+
+"""pen lift mode: z axis or FluidNC PWM servo"""
+pen_lift_mode = "z"
+
+"""initial FluidNC PWM servo positions; calibrate before plotting"""
+servo_up_s = 700
+servo_down_s = 800
+servo_delay_ms = 300
 
 """ decimal precision of gcode"""
 precision = 2

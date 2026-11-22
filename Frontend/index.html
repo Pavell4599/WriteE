@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f3f5f8">
+    <title>Плоттер</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <strong class="logo"><span class="logo-mark">П</span>ПЛОТТЕР</strong>
+        <span class="step-count" id="step-count" hidden>ШАГ 1 / 3</span>
+      </header>
+
+      <div class="progress" id="progress" aria-hidden="true" hidden>
+        <span class="current"></span><span></span><span></span>
+      </div>
+
+      <section class="main-menu" id="main-menu" aria-labelledby="menu-title">
+        <span class="menu-kicker">ГЛАВНОЕ МЕНЮ</span>
+        <h1 id="menu-title">ПЛОТТЕР</h1>
+        <button class="button button-primary menu-button" type="button" data-start>РИСОВАТЬ <span aria-hidden="true">→</span></button>
+      </section>
+
+      <form id="project-form" hidden>
+        <section class="screen active" id="screen-input" aria-labelledby="input-title">
+          <h1 id="input-title">ДОБАВЬТЕ РИСУНОК</h1>
+
+          <label class="dropzone surface" id="dropzone" for="source-file">
+            <input id="source-file" name="file" type="file" accept="image/*,.svg">
+            <span class="upload-mark" aria-hidden="true">↑</span>
+            <strong>ВЫБРАТЬ ИЗОБРАЖЕНИЕ</strong>
+            <span>ИЛИ ПЕРЕТАЩИТЕ СЮДА</span>
+            <small>PNG · JPG · SVG</small>
+          </label>
+          <div class="file-row surface hidden" id="file-row">
+            <span id="file-name"></span>
+            <button type="button" class="remove-file" id="remove-file" aria-label="УДАЛИТЬ ФАЙЛ">×</button>
+          </div>
+
+          <div class="or-label"><span>ИЛИ</span></div>
+          <label class="field-label" for="prompt">ТЕКСТ ДЛЯ РИСОВАНИЯ</label>
+          <div class="prompt-composer surface">
+            <textarea id="prompt" name="prompt" rows="4" placeholder="ВВЕДИТЕ ТЕКСТ"></textarea>
+            <div class="prompt-tools">
+              <span class="attachment-count" id="attachment-count">ФАЙЛОВ: 0</span>
+              <input id="prompt-files" name="attachments" type="file" multiple hidden>
+              <button class="button button-secondary attach-button" type="button" id="attach-files">＋ ДОБАВИТЬ ФАЙЛЫ</button>
+            </div>
+          </div>
+          <ul class="attachment-list" id="attachment-list" hidden></ul>
+          <label class="external-consent"><input id="external-ai-consent" type="checkbox"> ОТПРАВИТЬ ТЕКСТ ВНЕШНЕМУ AI. ФАЙЛЫ НЕ ОТПРАВЛЯЮТСЯ.</label>
+          <p class="error hidden" id="input-error" role="alert">ДОБАВЬТЕ ФАЙЛ ИЛИ ТЕКСТ.</p>
+
+          <div class="actions">
+            <button class="button button-secondary" type="button" data-menu>В МЕНЮ</button>
+            <button class="button button-primary" type="button" id="prepare-svg">СОЗДАТЬ SVG <span aria-hidden="true">→</span></button>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-svg" aria-labelledby="svg-title" hidden>
+          <h1 id="svg-title">НАСТРОЙТЕ РИСУНОК</h1>
+
+          <div class="layout">
+            <div class="preview">
+              <span class="field-label">ПРЕДПРОСМОТР SVG</span>
+              <p class="settings-note">ФОТО ПРЕОБРАЗУЕТСЯ В КОНТУРЫ. МЕЛКАЯ ТЕКСТУРА УПРОЩАЕТСЯ.</p>
+              <div class="paper surface">
+                <span id="svg-empty">НЕТ SVG</span>
+                <img id="svg-preview" alt="ПРЕДПРОСМОТР SVG" hidden>
+              </div>
+            </div>
+
+            <div class="settings">
+              <label class="field-label" for="pen-lift-mode">ПОДЪЁМ ПЕРА</label>
+              <select id="pen-lift-mode" name="pen_mode">
+                <option value="servo" selected>СЕРВО ЧЕРЕЗ FLUIDNC PWM</option>
+                <option value="z">ОСЬ Z</option>
+              </select>
+
+              <span class="field-label">РАБОЧЕЕ ПОЛЕ, ММ</span>
+              <div class="dimensions">
+                <label><span>ШИРИНА</span><input name="bed_width_mm" type="number" min="1" max="2000" step="1" value="300"></label>
+                <label><span>ВЫСОТА</span><input name="bed_height_mm" type="number" min="1" max="2000" step="1" value="350"></label>
+              </div>
+
+              <label class="field-label" for="speed">СКОРОСТЬ, ММ/С</label>
+              <input id="speed" name="speed_mm_s" type="number" min="1" max="100" step="1" value="5">
+
+              <div id="servo-settings">
+                <span class="field-label">СЕРВО, PWM S</span>
+                <div class="dimensions">
+                  <label><span>ПЕРО ВВЕРХ</span><input id="servo-up" name="servo_up_s" type="number" min="1" max="10000" step="1" value="700"></label>
+                  <label><span>РИСОВАНИЕ</span><input id="servo-down" name="servo_down_s" type="number" min="1" max="10000" step="1" value="800"></label>
+                </div>
+                <label class="field-label" for="servo-delay">ОЖИДАНИЕ СЕРВО, МС</label>
+                <input id="servo-delay" name="servo_delay_ms" type="number" min="0" max="2000" step="50" value="300">
+                <p class="settings-note">S700 / S800 — значения PWM, НЕ УГЛЫ. Стартовый диапазон для стандартного speed_map и 50 Гц. Настройте правильный spindle GPIO в FluidNC и проверьте ход без пера.</p>
+                <label class="calibration-row"><input id="servo-calibrated" type="checkbox"> Я ПРОВЕРИЛ ПОДЪЁМ И ОПУСКАНИЕ СЕРВО БЕЗ ПЕРА</label>
+              </div>
+
+              <div id="z-settings" hidden>
+                <span class="field-label">ПЕРО, Z (ММ)</span>
+                <div class="dimensions">
+                  <label><span>ВЕРХ</span><input id="z-up" name="z_up_mm" type="number" min="-50" max="50" step="0.1" value="4"></label>
+                  <label><span>РИСОВАНИЕ</span><input id="z-down" name="z_down_mm" type="number" min="-50" max="50" step="0.1" value="0"></label>
+                </div>
+              </div>
+
+              <span class="field-label">ПОЛОЖЕНИЕ</span>
+              <label class="range-row">X <input name="offset_x_percent" type="range" min="0" max="100" value="50"></label>
+              <label class="range-row">Y <input name="offset_y_percent" type="range" min="0" max="100" value="50"></label>
+            </div>
+          </div>
+
+          <p class="error hidden" id="svg-error" role="alert"></p>
+          <div class="actions">
+            <button class="button button-secondary" type="button" data-back>НАЗАД</button>
+            <button class="button button-primary" type="button" id="create-gcode">СОЗДАТЬ G-CODE <span aria-hidden="true">→</span></button>
+          </div>
+        </section>
+
+        <section class="screen" id="screen-plotter" aria-labelledby="plotter-title" hidden>
+          <h1 id="plotter-title">ПЛОТТЕР И G-CODE</h1>
+
+          <div class="device-status surface" role="status">
+            <span class="device-state"><span class="status-dot"></span><strong>НЕ ПОДКЛЮЧЕН</strong></span>
+          </div>
+
+          <label class="field-label" for="fluidnc-host">АДРЕС FLUIDNC</label>
+          <div class="device-connection">
+            <input id="fluidnc-host" type="text" inputmode="url" autocomplete="off" placeholder="192.168.1.100">
+            <button class="button button-secondary" type="button" id="check-fluidnc">ПРОВЕРИТЬ СВЯЗЬ</button>
+          </div>
+          <p class="connection-message" id="connection-message" role="status">ВВЕДИТЕ АДРЕС FLUIDNC В ЛОКАЛЬНОЙ СЕТИ.</p>
+
+          <label class="field-label" for="gcode">ПРЕДПРОСМОТР G-CODE</label>
+          <textarea id="gcode" name="gcode" rows="12" readonly placeholder="G-CODE ПОЯВИТСЯ ПОСЛЕ ГЕНЕРАЦИИ"></textarea>
+          <div class="download-row">
+            <button class="button button-secondary" type="button" id="download-gcode" disabled>СКАЧАТЬ G-CODE</button>
+          </div>
+          <p class="error hidden" id="plotter-error" role="alert"></p>
+
+          <div class="actions">
+            <button class="button button-secondary" type="button" data-back>НАЗАД</button>
+            <button class="button button-primary" type="button" id="send-gcode" disabled>РИСОВАТЬ</button>
+          </div>
+        </section>
+      </form>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+SVG to GCODE: svg2gcode_grlb
+IMAGE to SVG: https://github.com/SonarSonic/DrawingBotV3 скрипты
+CONNECTION to PLOTTER: 
+IMAGE GENERATION IN CHAT: g4f(lib) 

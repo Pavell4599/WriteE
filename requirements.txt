@@ -1,0 +1,7 @@
+Flask>=3.0,<4
+numpy>=2.0,<3
+opencv-python-headless>=4.11,<5
+Pillow>=11,<13
+vtracer==1.0.0a4
+g4f==6.8.0
+typing_extensions>=4.12
