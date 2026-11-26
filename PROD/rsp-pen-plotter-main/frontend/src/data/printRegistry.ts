@@ -1,0 +1,5326 @@
+// Unified registry for everything the editor calls a "style" or
+// "algorithm". Three previously-separate sources are merged here so the
+// UI has a single source of truth and the consolidated picker/galleries
+// don't have to query multiple modules.
+//
+//   - ALGORITHMS:   per-algorithm option schemas (defaults + knob types)
+//                   — backend renderers in
+//                   ``backend/pen_plotter/converters/algorithms/*.py``.
+//   - PRINT_STYLES: named bundles that the operator picks in one click.
+//                   Two scopes:
+//                     * scope='master' → owns segmentation method,
+//                       default algorithm, AND a per-band recipe used
+//                       after upload to override each produced layer.
+//                     * scope='layer'  → algorithm + options preset for
+//                       a single layer/pass. No segmentation responsibility.
+
+// =====================================================================
+// Algorithms (was algorithmSchemas.ts)
+// =====================================================================
+
+export type AlgorithmId =
+  | 'direct'
+  | 'halftone'
+  | 'stippling'
+  | 'crosshatch'
+  | 'contours'
+  | 'edges'
+  | 'centerline'
+  | 'spiral'
+  | 'scanlines'
+  | 'tsp'
+  // Algorithms shipped on the backend but historically not surfaced in
+  // the registry — exposing them unlocks new layer-level presets and
+  // the colour-master recipes below.
+  | 'flowfield'
+  | 'hilbert'
+  | 'gosper'
+  | 'eulerian_hatch'
+  | 'concentric_offset'
+  | 'tsp_opt'
+  | 'voronoi_stipple'
+  | 'squiggle'
+  | 'lowpoly'
+  | 'scribble'
+  // Geometric / generative texture fills added to broaden the colour
+  // and layer palettes — see ``backend/.../algorithms/{grid,brick,
+  // dashes,truchet,rings,sunburst,circle_pack}.py``.
+  | 'grid'
+  | 'brick'
+  | 'dashes'
+  | 'truchet'
+  | 'rings'
+  | 'sunburst'
+  | 'circle_pack'
+  // 2026-06 expert-style batch — see ``backend/.../algorithms/{ridge_lines,
+  // hitomezashi,cubic_disarray,quadtree,maze,phyllotaxis,voronoi_mosaic,
+  // curve_stitching,string_art,space_colonization,penrose}.py``.
+  | 'ridge_lines'
+  | 'hitomezashi'
+  | 'cubic_disarray'
+  | 'quadtree'
+  | 'maze'
+  | 'phyllotaxis'
+  | 'voronoi_mosaic'
+  | 'curve_stitching'
+  | 'string_art'
+  | 'space_colonization'
+  | 'penrose'
+  // 2026-06 expert-style batch 2 — see ``backend/.../algorithms/{dither,
+  // etch,noise_contours,reaction_diffusion,superpixel_hatch,moire,weave,
+  // honeycomb,harmonograph,attractor,text_fill}.py``.
+  | 'dither'
+  | 'etch'
+  | 'noise_contours'
+  | 'reaction_diffusion'
+  | 'superpixel_hatch'
+  | 'moire'
+  | 'weave'
+  | 'honeycomb'
+  | 'harmonograph'
+  | 'attractor'
+  | 'text_fill'
+  // 2026-06 expert-style batch 3.
+  | 'lsystem'
+  | 'chladni'
+  // 2026-06 new-algorithm batch.
+  | 'sine_halftone'
+  | 'ascii_shade'
+  | 'lichtenberg'
+  | 'warp_grid'
+  | 'scallop'
+
+export interface AlgoOption {
+  key: string
+  // i18n label key, e.g. ``convert.cellSize``. Consumers run this
+  // through ``t()`` themselves so the schema stays framework-agnostic.
+  label: string
+  // ``integer`` is rendered like ``number`` but the input is restricted
+  // to whole values (the backend casts via ``int(opts.get(...))``).
+  // ``select`` exposes ``choices`` as a dropdown for enum-typed knobs
+  // (e.g. tsp_opt's ``method``, flowfield's ``mode``). ``text`` is a
+  // free-form string (e.g. text_fill's repeated text).
+  type: 'number' | 'integer' | 'boolean' | 'select' | 'text'
+  min?: number
+  max?: number
+  step?: number
+  choices?: string[]
+}
+
+export interface AlgorithmSpec {
+  id: AlgorithmId
+  defaults: Record<string, unknown>
+  schema: AlgoOption[]
+}
+
+export const ALGORITHMS: Record<AlgorithmId, AlgorithmSpec> = {
+  direct: { id: 'direct', defaults: {}, schema: [] },
+  halftone: {
+    id: 'halftone',
+    defaults: { cell_size_mm: 2.2, angle_deg: 0, glyph: 'dot' },
+    schema: [
+      // Backend clamps to ``max(2, ...)``: anything below collapses adjacent
+      // dots into a solid fill, so the floor is 2 (was 1, silently clipped).
+      {
+        key: 'cell_size_mm',
+        label: 'convert.cellSize',
+        type: 'number',
+        min: 0.74,
+        max: 24,
+        step: 0.1,
+      },
+      { key: 'angle_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 180, step: 1 },
+      {
+        key: 'glyph',
+        label: 'convert.glyph',
+        type: 'select',
+        choices: ['dot', 'ring', 'square', 'diamond', 'cross'],
+      },
+    ],
+  },
+  stippling: {
+    id: 'stippling',
+    defaults: { density: 0.02, dot_radius_mm: 0.22, seed: 0 },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.001,
+        max: 0.5,
+        step: 0.001,
+      },
+      {
+        key: 'dot_radius_mm',
+        label: 'convert.dotRadius',
+        type: 'number',
+        min: 0.04,
+        max: 1.9,
+        step: 0.1,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  crosshatch: {
+    id: 'crosshatch',
+    defaults: { spacing_mm: 1.5, angle_deg: 45, crossed: false, joined: false },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'angle_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 180, step: 1 },
+      { key: 'crossed', label: 'convert.crossed', type: 'boolean' },
+      // Stitches sweeps into boustrophedon zig-zags (the former
+      // ``eulerian_hatch`` entry, folded in as an option).
+      { key: 'joined', label: 'convert.joined', type: 'boolean' },
+    ],
+  },
+  contours: {
+    id: 'contours',
+    defaults: { spacing_mm: 1.5, max_rings: 20 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'max_rings', label: 'convert.maxRings', type: 'integer', min: 1, max: 100, step: 1 },
+    ],
+  },
+  edges: {
+    id: 'edges',
+    // ``stroke_width`` is injected automatically from the pen slot at
+    // render time (see backend ``_style.stroke_attr_px``) — no operator
+    // knob.
+    defaults: {},
+    schema: [],
+  },
+  centerline: {
+    id: 'centerline',
+    // ``stroke_width`` is injected from the pen slot at render time — no
+    // operator knob (see backend ``_style.stroke_attr_px``).
+    defaults: { smooth: true, min_branch_mm: 1.1 },
+    schema: [
+      { key: 'smooth', label: 'convert.smooth', type: 'boolean' },
+      {
+        key: 'min_branch_mm',
+        label: 'convert.minBranch',
+        type: 'number',
+        min: 0,
+        max: 19,
+        step: 0.1,
+      },
+    ],
+  },
+  spiral: {
+    id: 'spiral',
+    defaults: { spacing_mm: 1.5, samples_per_turn: 64 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      {
+        key: 'samples_per_turn',
+        label: 'convert.samplesPerTurn',
+        type: 'integer',
+        min: 16,
+        max: 256,
+        step: 1,
+      },
+    ],
+  },
+  scanlines: {
+    id: 'scanlines',
+    defaults: { spacing_mm: 1.5, wave_amp_mm: 0, wave_period_mm: 4.5 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'wave_amp_mm', label: 'convert.waveAmp', type: 'number', min: 0, max: 7.4, step: 0.1 },
+      {
+        key: 'wave_period_mm',
+        label: 'convert.wavePeriod',
+        type: 'number',
+        min: 0.74,
+        max: 19,
+        step: 0.1,
+      },
+    ],
+  },
+  tsp: {
+    id: 'tsp',
+    defaults: { density: 0.02, seed: 0 },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.001,
+        max: 0.5,
+        step: 0.001,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  flowfield: {
+    id: 'flowfield',
+    defaults: {
+      mode: 'gradient',
+      seed_spacing_mm: 2.2,
+      step_mm: 0.3,
+      max_steps: 800,
+      bidirectional: true,
+      noise_scale: 32,
+      seed: 0,
+    },
+    schema: [
+      // Field source: ``gradient`` follows the image's structure, ``perlin``
+      // is decorative (image-independent).
+      {
+        key: 'mode',
+        label: 'convert.flowMode',
+        type: 'select',
+        choices: ['gradient', 'perlin'],
+      },
+      {
+        key: 'seed_spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'step_mm', label: 'convert.stepPx', type: 'number', min: 0.07, max: 1.1, step: 0.1 },
+      {
+        key: 'max_steps',
+        label: 'convert.maxSteps',
+        type: 'integer',
+        min: 50,
+        max: 4000,
+        step: 50,
+      },
+      { key: 'bidirectional', label: 'convert.bidirectional', type: 'boolean' },
+      {
+        key: 'noise_scale',
+        label: 'convert.noiseScale',
+        type: 'number',
+        min: 4,
+        max: 128,
+        step: 1,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  hilbert: {
+    id: 'hilbert',
+    defaults: { spacing_mm: 1.5, min_run_mm: 1.1, order: 0, adaptive: false },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      {
+        key: 'min_run_mm',
+        label: 'convert.minRunPx',
+        type: 'number',
+        min: 0.37,
+        max: 7.4,
+        step: 0.1,
+      },
+      // ``order`` overrides the auto-derived L-system depth (0 = auto, 1..8
+      // force that depth). Operators can tune ink density on small regions
+      // where the auto rule under-fills.
+      { key: 'order', label: 'convert.hilbertOrder', type: 'integer', min: 0, max: 8, step: 1 },
+      // Tone-adaptive traversal: deeper recursion (tighter curve) where
+      // the region is darker.
+      { key: 'adaptive', label: 'convert.adaptive', type: 'boolean' },
+    ],
+  },
+  gosper: {
+    id: 'gosper',
+    defaults: { order: 4, spacing_mm: 1.5, rotation_deg: 0 },
+    schema: [
+      { key: 'order', label: 'convert.gosperOrder', type: 'integer', min: 1, max: 6, step: 1 },
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'rotation_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 360, step: 5 },
+    ],
+  },
+  eulerian_hatch: {
+    id: 'eulerian_hatch',
+    defaults: { spacing_mm: 1.5, angle_deg: 45, crossed: false },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'angle_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 180, step: 1 },
+      { key: 'crossed', label: 'convert.crossed', type: 'boolean' },
+    ],
+  },
+  concentric_offset: {
+    id: 'concentric_offset',
+    defaults: { spacing_mm: 1.1, max_rings: 50, bridge: true },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'max_rings', label: 'convert.maxRings', type: 'integer', min: 1, max: 200, step: 1 },
+      { key: 'bridge', label: 'convert.bridge', type: 'boolean' },
+    ],
+  },
+  tsp_opt: {
+    id: 'tsp_opt',
+    defaults: {
+      density: 0.02,
+      max_points: 4000,
+      method: 'nn_2opt',
+      time_budget_s: 1.5,
+      seed: 0,
+      poisson_disk: true,
+    },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.001,
+        max: 0.5,
+        step: 0.001,
+      },
+      {
+        key: 'max_points',
+        label: 'convert.maxPoints',
+        type: 'integer',
+        min: 100,
+        max: 20000,
+        step: 100,
+      },
+      // ``nn_2opt`` (default) seeds with greedy NN then refines with 2-opt
+      // (best quality / time). ``nn`` is plain nearest-neighbour (fastest).
+      // ``mst`` follows the minimum spanning tree (different aesthetic).
+      {
+        key: 'method',
+        label: 'convert.tspMethod',
+        type: 'select',
+        choices: ['nn_2opt', 'nn', 'mst'],
+      },
+      {
+        key: 'time_budget_s',
+        label: 'convert.timeBudgetS',
+        type: 'number',
+        min: 0.1,
+        max: 10,
+        step: 0.1,
+      },
+      { key: 'poisson_disk', label: 'convert.poissonDisk', type: 'boolean' },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  voronoi_stipple: {
+    id: 'voronoi_stipple',
+    defaults: { density: 0.02, dot_radius_mm: 0.22, iterations: 6, seed: 0 },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.001,
+        max: 0.5,
+        step: 0.001,
+      },
+      {
+        key: 'dot_radius_mm',
+        label: 'convert.dotRadius',
+        type: 'number',
+        min: 0.04,
+        max: 1.9,
+        step: 0.1,
+      },
+      { key: 'iterations', label: 'convert.iterations', type: 'integer', min: 0, max: 30, step: 1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  sine_halftone: {
+    id: 'sine_halftone',
+    defaults: { spacing_mm: 1.9, amp_mm: 0.74, period_mm: 1.5 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'amp_mm', label: 'convert.waveAmp', type: 'number', min: 0.07, max: 3.7, step: 0.1 },
+      {
+        key: 'period_mm',
+        label: 'convert.wavePeriod',
+        type: 'number',
+        min: 0.37,
+        max: 7.4,
+        step: 0.1,
+      },
+    ],
+  },
+  ascii_shade: {
+    id: 'ascii_shade',
+    defaults: { cell_mm: 3.7 },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellSize', type: 'number', min: 1.5, max: 15, step: 0.1 },
+    ],
+  },
+  lichtenberg: {
+    id: 'lichtenberg',
+    defaults: { branches: 24, step_mm: 1.1, seed: 0 },
+    schema: [
+      { key: 'branches', label: 'convert.branches', type: 'integer', min: 2, max: 120, step: 1 },
+      { key: 'step_mm', label: 'convert.stepPx', type: 'number', min: 0.37, max: 3.7, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  warp_grid: {
+    id: 'warp_grid',
+    defaults: { spacing_mm: 1.9, strength_mm: 3.7 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 11,
+        step: 0.1,
+      },
+      {
+        key: 'strength_mm',
+        label: 'convert.warpStrength',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+    ],
+  },
+  scallop: {
+    id: 'scallop',
+    defaults: { scale_mm: 4.5 },
+    schema: [
+      { key: 'scale_mm', label: 'convert.cellSize', type: 'number', min: 1.5, max: 15, step: 0.1 },
+    ],
+  },
+  squiggle: {
+    id: 'squiggle',
+    defaults: {
+      spacing_mm: 1.5,
+      amp_mm: 0.52,
+      period_mm: 3,
+      jitter: 0.4,
+      mode: 'modulated',
+      seed: 0,
+    },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'amp_mm', label: 'convert.waveAmp', type: 'number', min: 0.04, max: 3, step: 0.1 },
+      {
+        key: 'period_mm',
+        label: 'convert.wavePeriod',
+        type: 'number',
+        min: 0.74,
+        max: 15,
+        step: 0.1,
+      },
+      { key: 'jitter', label: 'convert.jitter', type: 'number', min: 0, max: 1, step: 0.05 },
+      // ``modulated`` lets the amplitude track image tone; ``constant`` keeps
+      // a uniform wiggle — better for pure-decoration fills where tone shouldn't
+      // bleed into the pattern.
+      {
+        key: 'mode',
+        label: 'convert.squiggleMode',
+        type: 'select',
+        choices: ['modulated', 'constant'],
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  lowpoly: {
+    id: 'lowpoly',
+    defaults: { density: 0.01, seed: 0, stroke_width: 0.8 },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.001,
+        max: 0.1,
+        step: 0.001,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  scribble: {
+    id: 'scribble',
+    defaults: {
+      spacing_mm: 1.5,
+      amp_mm: 0.59,
+      overshoot_mm: 1.1,
+      angle_deg: 45,
+      crossed: false,
+      seed: 0,
+    },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'amp_mm', label: 'convert.waveAmp', type: 'number', min: 0, max: 3, step: 0.1 },
+      // ``overshoot_mm`` is the random extension each stroke runs past the
+      // boundary — the "sketchy" feel of scribble fill. 0 = clean stops at
+      // the boundary, higher values = scratchy / loose pencil.
+      {
+        key: 'overshoot_mm',
+        label: 'convert.overshoot',
+        type: 'number',
+        min: 0,
+        max: 7.4,
+        step: 0.1,
+      },
+      { key: 'angle_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 180, step: 1 },
+      { key: 'crossed', label: 'convert.crossed', type: 'boolean' },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  grid: {
+    id: 'grid',
+    defaults: { spacing_mm: 2.2 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+    ],
+  },
+  brick: {
+    id: 'brick',
+    defaults: { brick_w_mm: 5.9, brick_h_mm: 3 },
+    schema: [
+      { key: 'brick_w_mm', label: 'convert.brickW', type: 'number', min: 0.74, max: 22, step: 0.1 },
+      { key: 'brick_h_mm', label: 'convert.brickH', type: 'number', min: 0.74, max: 15, step: 0.1 },
+    ],
+  },
+  dashes: {
+    id: 'dashes',
+    defaults: { spacing_mm: 1.9, angle_deg: 45, dash_mm: 1.1, gap_mm: 1.1, crossed: false },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'angle_deg', label: 'convert.angleDeg', type: 'number', min: 0, max: 180, step: 1 },
+      { key: 'dash_mm', label: 'convert.dashPx', type: 'number', min: 0.19, max: 7.4, step: 0.1 },
+      { key: 'gap_mm', label: 'convert.gapPx', type: 'number', min: 0.19, max: 7.4, step: 0.1 },
+      { key: 'crossed', label: 'convert.crossed', type: 'boolean' },
+    ],
+  },
+  truchet: {
+    id: 'truchet',
+    defaults: { cell_mm: 3.7, seed: 0, tile: 'diagonal' },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 0.74, max: 15, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+      { key: 'tile', label: 'convert.tile', type: 'select', choices: ['diagonal', 'arc', 'mixed'] },
+    ],
+  },
+  rings: {
+    id: 'rings',
+    defaults: { spacing_mm: 2.2 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.37,
+        max: 11,
+        step: 0.1,
+      },
+    ],
+  },
+  sunburst: {
+    id: 'sunburst',
+    defaults: { rays: 120 },
+    schema: [{ key: 'rays', label: 'convert.rays', type: 'integer', min: 8, max: 720, step: 4 }],
+  },
+  circle_pack: {
+    id: 'circle_pack',
+    // ``attempts`` is intentionally omitted: the backend auto-scales the
+    // dart budget with the region area so the packing fills densely
+    // without the operator tuning it. Smaller radii ⇒ more bubbles.
+    // Defaults aligned with the backend ``opts.get`` fallbacks
+    // (``circle_pack.py``: 1.2 / 8.0) so the operator sees the same
+    // packing the backend renders when no override is set.
+    defaults: { min_radius_mm: 0.45, max_radius_mm: 3, gap_mm: 0.22, seed: 0 },
+    schema: [
+      {
+        key: 'min_radius_mm',
+        label: 'convert.minRadius',
+        type: 'number',
+        min: 0.19,
+        max: 3.7,
+        step: 0.1,
+      },
+      {
+        key: 'max_radius_mm',
+        label: 'convert.maxRadius',
+        type: 'number',
+        min: 0.37,
+        max: 15,
+        step: 0.1,
+      },
+      { key: 'gap_mm', label: 'convert.gapPx', type: 'number', min: 0, max: 3.7, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  ridge_lines: {
+    id: 'ridge_lines',
+    defaults: { spacing_mm: 2.2, amp_mm: 3.7, smooth_mm: 1.1, occlude: true, layout: 'rows' },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 15,
+        step: 0.1,
+      },
+      { key: 'amp_mm', label: 'convert.waveAmp', type: 'number', min: 0, max: 22, step: 0.1 },
+      { key: 'smooth_mm', label: 'convert.smooth', type: 'number', min: 0, max: 7.4, step: 0.1 },
+      { key: 'occlude', label: 'convert.hiddenLines', type: 'boolean' },
+      { key: 'layout', label: 'convert.mode', type: 'select', choices: ['rows', 'radial'] },
+    ],
+  },
+  hitomezashi: {
+    id: 'hitomezashi',
+    defaults: { cell_mm: 3, seed: 0 },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 1.1, max: 15, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  cubic_disarray: {
+    id: 'cubic_disarray',
+    defaults: { cell_mm: 4.5, max_rotate_deg: 35, max_offset_mm: 1.9, seed: 0 },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 1.5, max: 22, step: 0.1 },
+      {
+        key: 'max_rotate_deg',
+        label: 'convert.rotateMax',
+        type: 'number',
+        min: 0,
+        max: 90,
+        step: 1,
+      },
+      {
+        key: 'max_offset_mm',
+        label: 'convert.offsetMax',
+        type: 'number',
+        min: 0,
+        max: 11,
+        step: 0.1,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  quadtree: {
+    id: 'quadtree',
+    defaults: { min_cell_mm: 2.2, split_threshold: 0.12 },
+    schema: [
+      {
+        key: 'min_cell_mm',
+        label: 'convert.minCell',
+        type: 'number',
+        min: 0.74,
+        max: 24,
+        step: 0.1,
+      },
+      {
+        key: 'split_threshold',
+        label: 'convert.threshold',
+        type: 'number',
+        min: 0.01,
+        max: 0.9,
+        step: 0.01,
+      },
+    ],
+  },
+  maze: {
+    id: 'maze',
+    defaults: { cell_mm: 3, seed: 0 },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 1.1, max: 15, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  phyllotaxis: {
+    id: 'phyllotaxis',
+    defaults: { spacing_mm: 2.6, dot_radius_mm: 0.93, outline: false },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 11,
+        step: 0.1,
+      },
+      {
+        key: 'dot_radius_mm',
+        label: 'convert.dotRadius',
+        type: 'number',
+        min: 0.11,
+        max: 3.7,
+        step: 0.1,
+      },
+      { key: 'outline', label: 'convert.outline', type: 'boolean' },
+    ],
+  },
+  voronoi_mosaic: {
+    id: 'voronoi_mosaic',
+    defaults: { density: 0.004, seed: 0 },
+    schema: [
+      {
+        key: 'density',
+        label: 'convert.density',
+        type: 'number',
+        min: 0.0005,
+        max: 0.05,
+        step: 0.0005,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  curve_stitching: {
+    id: 'curve_stitching',
+    defaults: { cell_mm: 6.7, chords: 7, seed: 0 },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 3, max: 30, step: 0.1 },
+      { key: 'chords', label: 'convert.chords', type: 'integer', min: 3, max: 20, step: 1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  string_art: {
+    id: 'string_art',
+    defaults: { pegs: 96, lines: 350, fade: 0.25 },
+    schema: [
+      { key: 'pegs', label: 'convert.pegs', type: 'integer', min: 24, max: 240, step: 4 },
+      { key: 'lines', label: 'convert.lineCount', type: 'integer', min: 50, max: 1500, step: 10 },
+      { key: 'fade', label: 'convert.fade', type: 'number', min: 0.05, max: 1, step: 0.05 },
+    ],
+  },
+  space_colonization: {
+    id: 'space_colonization',
+    defaults: { attractors: 700, step_mm: 1.5, influence_mm: 15, kill_mm: 2.2, seed: 0 },
+    schema: [
+      {
+        key: 'attractors',
+        label: 'convert.attractors',
+        type: 'integer',
+        min: 100,
+        max: 4000,
+        step: 50,
+      },
+      { key: 'step_mm', label: 'convert.stepPx', type: 'number', min: 0.37, max: 5.6, step: 0.1 },
+      {
+        key: 'influence_mm',
+        label: 'convert.influencePx',
+        type: 'number',
+        min: 1.9,
+        max: 74,
+        step: 0.1,
+      },
+      { key: 'kill_mm', label: 'convert.killPx', type: 'number', min: 0.74, max: 15, step: 0.1 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  penrose: {
+    id: 'penrose',
+    defaults: { divisions: 6 },
+    schema: [
+      { key: 'divisions', label: 'convert.divisions', type: 'integer', min: 2, max: 9, step: 1 },
+    ],
+  },
+  dither: {
+    id: 'dither',
+    defaults: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'floyd' },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 0.74, max: 7.4, step: 0.1 },
+      {
+        key: 'dot_radius_mm',
+        label: 'convert.dotRadius',
+        type: 'number',
+        min: 0.07,
+        max: 1.9,
+        step: 0.1,
+      },
+      {
+        key: 'method',
+        label: 'convert.ditherMethod',
+        type: 'select',
+        choices: ['floyd', 'atkinson', 'bayer'],
+      },
+    ],
+  },
+  etch: {
+    id: 'etch',
+    defaults: { spacing_mm: 1.9, length_mm: 3.3, jitter: 0.3, seed: 0 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 7.4,
+        step: 0.1,
+      },
+      {
+        key: 'length_mm',
+        label: 'convert.strokeLen',
+        type: 'number',
+        min: 0.74,
+        max: 15,
+        step: 0.1,
+      },
+      { key: 'jitter', label: 'convert.jitter', type: 'number', min: 0, max: 1, step: 0.05 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  noise_contours: {
+    id: 'noise_contours',
+    defaults: { levels: 12, noise_scale: 60, noise_amp: 0.35, seed: 0 },
+    schema: [
+      { key: 'levels', label: 'convert.levels', type: 'integer', min: 3, max: 40, step: 1 },
+      {
+        key: 'noise_scale',
+        label: 'convert.noiseScale',
+        type: 'number',
+        min: 10,
+        max: 300,
+        step: 5,
+      },
+      { key: 'noise_amp', label: 'convert.noiseAmp', type: 'number', min: 0, max: 2, step: 0.05 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  reaction_diffusion: {
+    id: 'reaction_diffusion',
+    defaults: { pattern: 'spots', steps: 2500, seed: 0 },
+    schema: [
+      { key: 'pattern', label: 'convert.pattern', type: 'select', choices: ['spots', 'stripes'] },
+      { key: 'steps', label: 'convert.maxSteps', type: 'integer', min: 500, max: 8000, step: 100 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  superpixel_hatch: {
+    id: 'superpixel_hatch',
+    defaults: { regions: 180, spacing_mm: 1.5, seed: 0 },
+    schema: [
+      { key: 'regions', label: 'convert.regions', type: 'integer', min: 20, max: 800, step: 10 },
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.56,
+        max: 7.4,
+        step: 0.1,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  moire: {
+    id: 'moire',
+    defaults: { spacing_mm: 1.9, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+    schema: [
+      {
+        key: 'spacing_mm',
+        label: 'convert.spacing',
+        type: 'number',
+        min: 0.74,
+        max: 7.4,
+        step: 0.1,
+      },
+      { key: 'mode', label: 'convert.mode', type: 'select', choices: ['rings', 'lines'] },
+      { key: 'offset_mm', label: 'convert.offsetPx', type: 'number', min: 0, max: 30, step: 0.1 },
+      {
+        key: 'delta_deg',
+        label: 'convert.angleDeg',
+        type: 'number',
+        min: 0.5,
+        max: 20,
+        step: 0.5,
+      },
+    ],
+  },
+  weave: {
+    id: 'weave',
+    defaults: { band_mm: 4.5, gap_mm: 0.74 },
+    schema: [
+      { key: 'band_mm', label: 'convert.bandPx', type: 'number', min: 1.5, max: 22, step: 0.1 },
+      { key: 'gap_mm', label: 'convert.gapPx', type: 'number', min: 0.19, max: 3.7, step: 0.1 },
+    ],
+  },
+  honeycomb: {
+    id: 'honeycomb',
+    defaults: { cell_mm: 4.5, mode: 'grid' },
+    schema: [
+      { key: 'cell_mm', label: 'convert.cellPx', type: 'number', min: 1.5, max: 22, step: 0.1 },
+      { key: 'mode', label: 'convert.mode', type: 'select', choices: ['grid', 'scaled'] },
+    ],
+  },
+  harmonograph: {
+    id: 'harmonograph',
+    defaults: { freq_ratio: 2.01, damping: 0.004, turns: 40, seed: 0 },
+    schema: [
+      { key: 'freq_ratio', label: 'convert.freqRatio', type: 'number', min: 1, max: 5, step: 0.01 },
+      {
+        key: 'damping',
+        label: 'convert.damping',
+        type: 'number',
+        min: 0.0005,
+        max: 0.02,
+        step: 0.0005,
+      },
+      { key: 'turns', label: 'convert.turns', type: 'integer', min: 5, max: 150, step: 5 },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  attractor: {
+    id: 'attractor',
+    defaults: { preset: 'dejong', points: 6000, dot_radius_mm: 0.19, seed: 0 },
+    schema: [
+      {
+        key: 'preset',
+        label: 'convert.pattern',
+        type: 'select',
+        choices: ['dejong', 'clifford'],
+      },
+      {
+        key: 'points',
+        label: 'convert.maxPoints',
+        type: 'integer',
+        min: 500,
+        max: 20000,
+        step: 500,
+      },
+      {
+        key: 'dot_radius_mm',
+        label: 'convert.dotRadius',
+        type: 'number',
+        min: 0.07,
+        max: 1.1,
+        step: 0.1,
+      },
+      { key: 'seed', label: 'convert.seed', type: 'integer', min: 0, step: 1 },
+    ],
+  },
+  text_fill: {
+    id: 'text_fill',
+    defaults: { text: 'OmniPlot ', font_size_mm: 4.5, line_spacing: 1.25, threshold: 0.35 },
+    schema: [
+      { key: 'text', label: 'convert.text', type: 'text' },
+      {
+        key: 'font_size_mm',
+        label: 'convert.fontSize',
+        type: 'number',
+        min: 1.5,
+        max: 22,
+        step: 0.1,
+      },
+      {
+        key: 'line_spacing',
+        label: 'convert.lineSpacing',
+        type: 'number',
+        min: 0.8,
+        max: 3,
+        step: 0.05,
+      },
+      {
+        key: 'threshold',
+        label: 'convert.threshold',
+        type: 'number',
+        min: 0,
+        max: 0.95,
+        step: 0.05,
+      },
+    ],
+  },
+  lsystem: {
+    id: 'lsystem',
+    defaults: { preset: 'dragon', iterations: 0 },
+    schema: [
+      {
+        key: 'preset',
+        label: 'convert.pattern',
+        type: 'select',
+        choices: ['dragon', 'plant', 'koch', 'sierpinski'],
+      },
+      { key: 'iterations', label: 'convert.iterations', type: 'integer', min: 0, max: 12, step: 1 },
+    ],
+  },
+  chladni: {
+    id: 'chladni',
+    defaults: { m: 3, n: 5, modes: 1 },
+    schema: [
+      { key: 'm', label: 'convert.modeM', type: 'integer', min: 1, max: 12, step: 1 },
+      { key: 'n', label: 'convert.modeN', type: 'integer', min: 1, max: 12, step: 1 },
+      { key: 'modes', label: 'convert.levels', type: 'integer', min: 1, max: 7, step: 1 },
+    ],
+  },
+}
+
+// Backend-flagged duplicates: still registered (persisted layers keep
+// rendering, ``getAlgorithm`` keeps resolving them) but pickers must not
+// offer them for new layers. Mirrors ``_HIDDEN`` in
+// ``backend/pen_plotter/converters/algorithms/__init__.py``.
+export const HIDDEN_ALGORITHMS: ReadonlySet<AlgorithmId> = new Set([
+  'tsp',
+  'grid',
+  'eulerian_hatch',
+  'contours',
+])
+
+export function getAlgorithm(id: string | null | undefined): AlgorithmSpec | null {
+  if (!id) return null
+  return (ALGORITHMS as Record<string, AlgorithmSpec>)[id] ?? null
+}
+
+export function defaultsFor(id: string): Record<string, unknown> {
+  return { ...(getAlgorithm(id)?.defaults ?? {}) }
+}
+
+// =====================================================================
+// Styles — master (segmentation + per-band recipe) and layer (per-layer
+// algorithm preset)
+// =====================================================================
+
+export type StyleScope = 'master' | 'layer'
+export type PrintStyleKind = 'image' | 'schematic' | 'text'
+export type SegmentationMethod =
+  | 'kmeans'
+  | 'kmeans_lab'
+  | 'luminance_bands'
+  | 'thresholds'
+  | 'fixed_palette'
+  | 'palette_dither'
+  | 'otsu'
+// Master styles split by print mode: ``monochrome`` styles drive the
+// mono master pipeline (luminance_bands / thresholds + bandRecipe).
+// ``multicolor`` styles drive the multicolour pipeline (kmeans /
+// fixed_palette + colorRecipe). Layer styles are mode-agnostic.
+export type PrintStyleMode = 'monochrome' | 'multicolor'
+
+// What an applied recipe sends per band/layer. Mirrors the
+// ``algorithm`` + ``algorithm_options`` pair the backend's /rerender
+// endpoint expects.
+export interface BandRecipe {
+  algorithm: AlgorithmId
+  algorithm_options: Record<string, unknown>
+}
+
+// Segmentation block carried by master styles. Drives what
+// SourceSection ships at upload time. Layer styles have no segmentation
+// responsibility.
+export interface StyleSegmentation {
+  method: SegmentationMethod
+  default_num_bands?: number // luminance_bands
+  default_threshold?: number // thresholds (single split → binary)
+  default_num_colors?: number // kmeans
+  drop_background: boolean
+  background_luminance: number
+  // When true, the UI exposes a bands slider for this style (mainly
+  // shaded modes). Binary modes hide it.
+  knob_bands: boolean
+  // Preferred segmentation canvas size (``max_dimension_px``) when this
+  // style is applied. Line-art / outline / centerline styles set a high
+  // value here: at the global 800 px default, fine strokes blur together
+  // and the outline trace collapses detail. Omitted → the operator's
+  // current detail tier is left untouched.
+  default_max_dimension_px?: number
+}
+
+export interface PrintStyle {
+  id: string
+  labelKey: string
+  descriptionKey?: string
+  applicableTo: PrintStyleKind[]
+  scope: StyleScope
+
+  // Master-style print mode. ``undefined`` means the style works in
+  // both modes (legacy contract — only mono masters existed pre-merge,
+  // so omitted = monochrome). Layer styles ignore this field.
+  mode?: PrintStyleMode
+
+  // Master styles segment the bitmap themselves; layer styles inherit
+  // the colors tab's segmentation untouched.
+  segmentation?: StyleSegmentation
+
+  // Default algorithm + options used when the style is applied. For
+  // master styles this is what /upload renders with before per-band
+  // overrides; for layer styles this is what /rerender installs.
+  defaultAlgorithm: AlgorithmId
+  defaultAlgorithmOptions: Record<string, unknown>
+
+  // Optional per-band override applied after /upload finishes. Only
+  // master shaded modes set this (Pencil, Halftone shaded, Stippling
+  // photo, Engraving, Contours-topo). Binary master modes and layer
+  // styles leave it undefined.
+  bandRecipe?: (bandIndex: number, totalBands: number) => BandRecipe | null
+
+  // Per-colour-cluster recipe for multicolour master styles. ``colorIndex``
+  // is the cluster's position in the layer order (darkest first, mirroring
+  // ``bandRecipe``); ``totalColors`` is the cluster count; ``hex`` is the
+  // cluster's RGB centroid (so recipes that tune by hue — CMYK halftone
+  // angles, e.g. — can branch on it). Returns null to fall back to the
+  // style's default algorithm + options for that cluster.
+  colorRecipe?: (colorIndex: number, totalColors: number, hex: string) => BandRecipe | null
+}
+
+// Helper: linear interpolation across band index for spacing / density
+// recipes. ``i`` 0..total-1, returns ``from`` at i=0 and ``to`` at
+// i=total-1 (or ``from`` if total<=1). Exported so ``useBitmapDraft``
+// can reuse it when synthesising per-band recipes from operator-tuned
+// ranges.
+export function lerp(i: number, total: number, from: number, to: number): number {
+  if (total <= 1) return from
+  return from + (to - from) * (i / (total - 1))
+}
+
+// Default min/max ranges + angle lists for the monochrome master
+// styles. These mirror the constants that used to live inline in each
+// ``bandRecipe`` below; hoisting them lets ``useBitmapDraft.defaultMono()``
+// pre-populate the operator-facing knobs from the same source of truth
+// the fallback ``bandRecipe`` still uses.
+export const MONO_STYLE_DEFAULTS: Record<string, Record<string, unknown>> = {
+  pencil: {
+    spacing_min: 0.93,
+    spacing_max: 2.4,
+    // Limited to the four angles the chip picker exposes (0/45/90/135)
+    // so the active state of each chip on first paint matches the
+    // operator's intuition. The 30°/150° pair that lived here pre-
+    // refactor wasn't selectable from the UI, only visible after a
+    // /preview round-trip — confusing.
+    angles: [45, 135, 0, 90],
+    crossed_on_darkest: true,
+  },
+  'halftone-shade': {
+    cell_min: 1.1,
+    cell_max: 3.3,
+  },
+  'stippling-shade': {
+    density_min: 0.012,
+    // Darkest band: ~15% of region pixels become dots. The old 0.06
+    // (6%) read too faint to register as a dark tone; the slider now
+    // reaches 0.5 so very dense stippling is reachable for true blacks.
+    density_max: 0.15,
+    dot_radius: 0.19,
+  },
+  engraving: {
+    spacing_min: 0.67,
+    spacing_max: 1.9,
+    wave_min: 0.22,
+    wave_max: 0.59,
+    wave_period: 5.2,
+  },
+  'contours-topo': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    rings_min: 10,
+    rings_max: 30,
+  },
+  outline: {
+    stroke_width: 0.8,
+  },
+  tsp: {
+    density: 0.04,
+  },
+  'spiral-master': {
+    // Open turn spacing so the per-pixel wobble is clearly visible (a
+    // tight spiral merges into near-solid and hides the tone). Wobble's
+    // spatial wavelength + a 0..1 strength on the per-pixel amplitude.
+    spacing_mm: 5.2,
+    wavelength_mm: 3.7,
+    tone_strength: 1,
+  },
+  'centerline-trace': {
+    stroke_width: 0.8,
+  },
+  'flowfield-master': {
+    // Streamline seed spacing lerped dark→light (dense shadows, sparse
+    // highlights).
+    spacing_min: 1.5,
+    spacing_max: 4.5,
+  },
+  'voronoi-shade': {
+    // Aligned with ``stippling-shade`` — both expose the same density
+    // slider (0.005..0.5), so their defaults must match for a consistent
+    // dark→light tonal ramp between the two pointillist masters.
+    density_min: 0.012,
+    density_max: 0.15,
+    dot_radius: 0.19,
+  },
+  'hatch-fill': {
+    spacing_min: 0.93,
+    spacing_max: 2.4,
+    angles: [45, 135, 0, 90],
+    crossed_on_darkest: true,
+  },
+  'squiggle-shade': {
+    spacing_min: 1.1,
+    spacing_max: 2.6,
+    // Wiggle amplitude lerped dark→light (wider in shadows).
+    wave_min: 0.3,
+    wave_max: 0.82,
+    wave_period: 3,
+  },
+  'hilbert-fill': {
+    spacing_min: 1.1,
+    spacing_max: 3,
+  },
+  // gosper-fill intentionally has no operator knobs: its tone is driven by
+  // the L-system order, which the registry's bandRecipe lerps across bands.
+  // (spacing only scales the curve, so a spacing knob would be a no-op.)
+  'concentric-rings': {
+    spacing_min: 1.1,
+    spacing_max: 2.2,
+    rings_min: 12,
+    rings_max: 50,
+  },
+  'tsp-optimized': {
+    density: 0.04,
+  },
+  lowpoly: {
+    // Point density lerped dark→light (smaller facets in shadows).
+    density_min: 0.006,
+    density_max: 0.04,
+  },
+  scribble: {
+    spacing_min: 0.93,
+    spacing_max: 2.4,
+    angles: [45, 135, 0, 90],
+    crossed_on_darkest: true,
+  },
+  // Phase-2 banded patterns (2026-06): the dual ranges feed the same
+  // dark→light lerp the registry ``bandRecipe`` defaults encode, so the
+  // sliders and the hardcoded recipes always agree on which knob is the
+  // tonal axis.
+  'truchet-tiles': { cell_min: 2.2, cell_max: 5.2 },
+  'maze-walk': { cell_min: 2.2, cell_max: 4.5 },
+  'basket-weave': { band_min: 3, band_max: 6.7 },
+  'stitch-rows': { cell_min: 2.2, cell_max: 4.5 },
+  'bubble-pack': { radius_min: 1.5, radius_max: 3.7, gap_mm: 0.22 },
+  'brick-courses': { cell_min: 2.2, cell_max: 4.5 },
+  'dash-shading': { spacing_min: 1.1, spacing_max: 2.6, angles: [45, 135, 0, 90], dash_mm: 1.1 },
+  'vinyl-rings': { spacing_min: 1.1, spacing_max: 3 },
+  'sunburst-rays': { rays_min: 70, rays_max: 220 },
+  'thread-fans': { cell_min: 4.5, cell_max: 8, chords: 9 },
+  'moire-beat': { spacing_min: 1.1, spacing_max: 2.6 },
+  'penrose-facets': { divisions: 7 },
+  // Variant batch (2026-06): banded select-option twins.
+  'ring-halftone': { cell_min: 1.1, cell_max: 3.3 },
+  'cross-stitch': { cell_min: 1.5, cell_max: 3.7 },
+  'truchet-pipes': { cell_min: 2.2, cell_max: 5.2 },
+  'moire-lines': { spacing_min: 1.1, spacing_max: 2.6 },
+}
+
+// Defaults for the multicolour master family. Mirrors MONO_STYLE_DEFAULTS:
+// each entry is the operator-tunable knob set for one style, hoisted so
+// ``useBitmapDraft.defaultMulticolor()`` can pre-populate the params
+// card and the registry's ``colorRecipe`` can read the same values.
+// Ranges that lerp across clusters use ``_min`` (applied to the darkest
+// cluster) / ``_max`` (lightest cluster) pairs — same convention as
+// the mono recipes so the DualRangeSlider component is reusable.
+export const MULTICOLOR_STYLE_DEFAULTS: Record<string, Record<string, unknown>> = {
+  'color-flat': {
+    // Aplats sans paramètres modulables ; gardé vide pour que la carte
+    // params affiche un placeholder explicite plutôt qu'un slider
+    // factice.
+  },
+  'color-crosshatch': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    angle_step: 45,
+    crossed: false,
+  },
+  'color-stipple': {
+    density_min: 0.02,
+    density_max: 0.18,
+    dot_radius: 0.19,
+    iterations: 4,
+  },
+  'color-halftone-cmyk': {
+    cell_size: 1.9,
+  },
+  'color-contours-topo': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    rings_min: 10,
+    rings_max: 30,
+  },
+  'color-flowfield': {
+    seed_spacing_min: 2.2,
+    seed_spacing_max: 4.5,
+    step_mm: 0.3,
+    max_steps: 600,
+    noise_scale: 48,
+    bidirectional: true,
+  },
+  'color-sketch': {
+    spacing_min: 1.1,
+    spacing_max: 2.2,
+    amp_min: 0.22,
+    amp_max: 0.67,
+    period_mm: 3,
+    jitter: 0.45,
+  },
+  'color-spiral': {
+    spacing_min: 0.74,
+    spacing_max: 1.9,
+    max_rings: 40,
+  },
+  'color-stippling-classic': {
+    density_min: 0.02,
+    density_max: 0.18,
+    dot_radius: 0.19,
+  },
+  'color-edges': {
+    stroke_width: 0.8,
+  },
+  'color-centerline': {
+    stroke_width: 0.8,
+    min_branch_mm: 1.1,
+  },
+  'color-spiral-classic': {
+    spacing_min: 0.74,
+    spacing_max: 1.9,
+    samples_per_turn: 64,
+  },
+  'color-scanlines': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    wave_amp_mm: 0,
+    wave_period_mm: 4.5,
+  },
+  'color-tsp': {
+    density_min: 0.02,
+    density_max: 0.12,
+  },
+  'color-hilbert': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    min_run_mm: 1.1,
+  },
+  'color-gosper': {
+    order: 4,
+    spacing_min: 1.1,
+    spacing_max: 1.9,
+  },
+  'color-eulerian': {
+    spacing_min: 0.93,
+    spacing_max: 2.2,
+    angle_step: 45,
+    crossed: false,
+  },
+  'color-tsp-opt': {
+    density_min: 0.02,
+    density_max: 0.12,
+    max_points: 8000,
+    time_budget_s: 2.0,
+  },
+  // Geometric / generative colour masters — global knobs so the operator
+  // can tune them across clusters like the hatch / stipple families.
+  'color-grid': {
+    spacing_min: 1.1,
+    spacing_max: 2.6,
+  },
+  'color-brick': {
+    cell_min: 2.2,
+    cell_max: 4.5,
+  },
+  'color-dashes': {
+    spacing_min: 1.1,
+    spacing_max: 2.2,
+    angle_step: 45,
+    dash_mm: 1.1,
+    gap_mm: 1.1,
+  },
+  'color-truchet': {
+    cell_min: 2.6,
+    cell_max: 5.2,
+  },
+  'color-rings': {
+    spacing_min: 1.5,
+    spacing_max: 3,
+  },
+  'color-sunburst': {
+    rays_min: 60,
+    rays_max: 160,
+  },
+  'color-circle-pack': {
+    radius_min: 1.1,
+    radius_max: 2.6,
+    gap_mm: 0.22,
+  },
+}
+
+// Naming convention to resolve old collisions between mono modes and
+// per-layer presets:
+//   - master shaded photo modes keep simple ids: pencil, halftone-shade,
+//     stippling-shade, engraving, contours-topo, spiral-master (tonal
+//     amplitude-modulated spiral)
+//   - master binary modes: outline, tsp
+//   - layer presets keep their original ids (direct, halftone-fine,
+//     halftone-coarse, stippling-portrait, crosshatch-tech, contours,
+//     edges, spiral, scanlines)
+// Ids that previously clashed (``contours`` was both a mono mode and a
+// layer preset, ``spiral`` likewise) now have distinct ids; placement
+// rehydration maps the old ids to the new ones in ``useBitmapDraft``.
+
+export const PRINT_STYLES: PrintStyle[] = [
+  // ============== MASTER STYLES — shaded (luminance bands) ==============
+  {
+    id: 'pencil',
+    labelKey: 'mono.modes.pencil',
+    descriptionKey: 'mono.modes.pencilDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      // Default to a single luminance band → one layer, one pen. The
+      // shading slider (knob_bands) lets the operator add bands when they
+      // want tonal shading; each extra band is an extra layer they opt
+      // into explicitly.
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'crosshatch',
+    defaultAlgorithmOptions: { angle_deg: 45, spacing_mm: 1.5, crossed: false },
+    bandRecipe(i, total) {
+      const angles = [45, 135, 0, 90, 30, 150]
+      const angle = angles[i % angles.length] ?? 45
+      const spacing = lerp(i, total, 0.93, 2.4)
+      const crossed = i === 0 && total > 1
+      return {
+        algorithm: 'crosshatch',
+        algorithm_options: { angle_deg: angle, spacing_mm: spacing, crossed },
+      }
+    },
+  },
+  {
+    id: 'halftone-shade',
+    labelKey: 'mono.modes.halftone',
+    descriptionKey: 'mono.modes.halftoneDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      // Default to a single luminance band → one layer, one pen. The
+      // shading slider (knob_bands) lets the operator add bands when they
+      // want tonal shading; each extra band is an extra layer they opt
+      // into explicitly.
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'halftone',
+    defaultAlgorithmOptions: { cell_size_mm: 1.9 },
+    bandRecipe(i, total) {
+      const cell = lerp(i, total, 1.1, 3.3)
+      return { algorithm: 'halftone', algorithm_options: { cell_size_mm: cell } }
+    },
+  },
+  {
+    id: 'stippling-shade',
+    labelKey: 'mono.modes.stippling',
+    descriptionKey: 'mono.modes.stipplingDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      // Default to a single luminance band → one layer, one pen. The
+      // shading slider (knob_bands) lets the operator add bands when they
+      // want tonal shading; each extra band is an extra layer they opt
+      // into explicitly.
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'stippling',
+    defaultAlgorithmOptions: { density: 0.08, dot_radius_mm: 0.19, seed: 0 },
+    bandRecipe(i, total) {
+      const density = lerp(i, total, 0.15, 0.012)
+      return {
+        algorithm: 'stippling',
+        algorithm_options: { density, dot_radius_mm: 0.19, seed: i * 7 + 13 },
+      }
+    },
+  },
+  {
+    id: 'engraving',
+    labelKey: 'mono.modes.engraving',
+    descriptionKey: 'mono.modes.engravingDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      // Single band by default (one layer, one pen); shading slider adds
+      // bands when the operator wants tonal depth.
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'scanlines',
+    defaultAlgorithmOptions: { spacing_mm: 1.1, wave_amp_mm: 0, wave_period_mm: 4.5 },
+    bandRecipe(i, total) {
+      const spacing = lerp(i, total, 0.67, 1.9)
+      const wave = lerp(i, total, 0.22, 0.59)
+      return {
+        algorithm: 'scanlines',
+        algorithm_options: { spacing_mm: spacing, wave_amp_mm: wave, wave_period_mm: 5.2 },
+      }
+    },
+  },
+  {
+    id: 'contours-topo',
+    labelKey: 'mono.modes.contours',
+    descriptionKey: 'mono.modes.contoursDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      // Default to a single luminance band → one layer, one pen. The
+      // shading slider (knob_bands) lets the operator add bands when they
+      // want tonal shading; each extra band is an extra layer they opt
+      // into explicitly.
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'contours',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, max_rings: 20 },
+    bandRecipe(i, total) {
+      const spacing = lerp(i, total, 0.93, 2.2)
+      const rings = Math.round(lerp(i, total, 30, 10))
+      return {
+        algorithm: 'contours',
+        algorithm_options: { spacing_mm: spacing, max_rings: rings },
+      }
+    },
+  },
+  {
+    id: 'flowfield-master',
+    labelKey: 'mono.modes.flowField',
+    descriptionKey: 'mono.modes.flowFieldDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'flowfield',
+    defaultAlgorithmOptions: {
+      seed_spacing_mm: 2.2,
+      step_mm: 0.3,
+      max_steps: 800,
+      bidirectional: true,
+      mode: 'gradient',
+      seed: 0,
+    },
+    bandRecipe(i, total) {
+      // Dark bands seed streamlines densely (small spacing), light bands
+      // sparsely — the field follows the image gradient so strokes curve
+      // along edges like a wind map.
+      const seedSpacing = lerp(i, total, 1.5, 4.5)
+      return {
+        algorithm: 'flowfield',
+        algorithm_options: {
+          seed_spacing_mm: seedSpacing,
+          step_mm: 0.3,
+          max_steps: 800,
+          bidirectional: true,
+          mode: 'gradient',
+          seed: i * 7 + 13,
+        },
+      }
+    },
+  },
+  {
+    id: 'voronoi-shade',
+    labelKey: 'mono.modes.voronoiShade',
+    descriptionKey: 'mono.modes.voronoiShadeDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'voronoi_stipple',
+    defaultAlgorithmOptions: { density: 0.08, dot_radius_mm: 0.19, iterations: 6, seed: 0 },
+    bandRecipe(i, total) {
+      // Like stippling-shade but the dots are Lloyd-relaxed → far more
+      // even spacing, the "weighted Voronoi stipple" look. Density range
+      // mirrors stippling-shade so the two pointillist masters share a
+      // tonal ramp.
+      const density = lerp(i, total, 0.15, 0.012)
+      return {
+        algorithm: 'voronoi_stipple',
+        algorithm_options: { density, dot_radius_mm: 0.19, iterations: 6, seed: i * 7 + 13 },
+      }
+    },
+  },
+  {
+    id: 'hatch-fill',
+    labelKey: 'mono.modes.hatchFill',
+    descriptionKey: 'mono.modes.hatchFillDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'eulerian_hatch',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, angle_deg: 45, crossed: false },
+    bandRecipe(i, total) {
+      // Same rotating-angle idea as pencil, but the hatch lines are
+      // stitched into one Eulerian path per layer → far fewer pen lifts.
+      const angles = [45, 135, 0, 90, 30, 150]
+      const angle = angles[i % angles.length] ?? 45
+      const spacing = lerp(i, total, 0.93, 2.4)
+      const finalAngles = i === 0 && total > 1 ? [angle, (angle + 90) % 180] : [angle]
+      return {
+        algorithm: 'eulerian_hatch',
+        algorithm_options: { angles: finalAngles, spacing_mm: spacing },
+      }
+    },
+  },
+  {
+    id: 'squiggle-shade',
+    labelKey: 'mono.modes.squiggleShade',
+    descriptionKey: 'mono.modes.squiggleShadeDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'squiggle',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, amp_mm: 0.52, period_mm: 3, jitter: 0.4, seed: 0 },
+    bandRecipe(i, total) {
+      // Wavy hand-drawn rows: dark bands pack tighter rows with a wider
+      // wiggle, light bands relax to a thin near-straight line.
+      const spacing = Math.round(lerp(i, total, 1.1, 2.6) * 10) / 10
+      const amp = lerp(i, total, 0.82, 0.3)
+      return {
+        algorithm: 'squiggle',
+        algorithm_options: {
+          spacing_mm: spacing,
+          amp_mm: amp,
+          period_mm: 3,
+          jitter: 0.4,
+          seed: i * 7 + 13,
+        },
+      }
+    },
+  },
+  {
+    id: 'hilbert-fill',
+    labelKey: 'mono.modes.hilbertFill',
+    descriptionKey: 'mono.modes.hilbertFillDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'hilbert',
+    // adaptive: the curve recurses deeper where the image is darker, so
+    // the single-band default still shades the source tone instead of
+    // filling the silhouette at uniform density.
+    defaultAlgorithmOptions: { spacing_mm: 1.5, min_run_mm: 1.1, adaptive: true },
+    bandRecipe(i, total) {
+      // Single continuous Hilbert curve fills each band; tighter spacing
+      // on dark bands packs more ink, and adaptive recursion shades the
+      // tone within each band.
+      const spacing = lerp(i, total, 1.1, 3)
+      return {
+        algorithm: 'hilbert',
+        algorithm_options: { spacing_mm: spacing, min_run_mm: 1.1, adaptive: true },
+      }
+    },
+  },
+  {
+    id: 'gosper-fill',
+    labelKey: 'mono.modes.gosperFill',
+    descriptionKey: 'mono.modes.gosperFillDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'gosper',
+    defaultAlgorithmOptions: { order: 4, spacing_mm: 1.5, rotation_deg: 0 },
+    bandRecipe(i, total) {
+      // Gosper (flowsnake) space-filling curve — a softer, hexagonal
+      // cousin of Hilbert. Its density is set by the L-system ``order``
+      // (NOT spacing, which only scales the curve to the bbox), so tone
+      // comes from lerping the order: deeper on dark bands, shallower on
+      // light ones.
+      const order = Math.round(lerp(i, total, 4, 2))
+      return {
+        algorithm: 'gosper',
+        algorithm_options: { order, spacing_mm: 1.5, rotation_deg: 0 },
+      }
+    },
+  },
+  {
+    id: 'concentric-rings',
+    labelKey: 'mono.modes.concentricRings',
+    descriptionKey: 'mono.modes.concentricRingsDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'concentric_offset',
+    defaultAlgorithmOptions: { spacing_mm: 1.1, max_rings: 50, bridge: true },
+    bandRecipe(i, total) {
+      // Erodes the region into nested offset rings stitched into a single
+      // spiral path. Dark bands get tighter spacing and more rings.
+      const spacing = Math.round(lerp(i, total, 1.1, 2.2) * 10) / 10
+      const rings = Math.round(lerp(i, total, 50, 12))
+      return {
+        algorithm: 'concentric_offset',
+        algorithm_options: { spacing_mm: spacing, max_rings: rings, bridge: true },
+      }
+    },
+  },
+  {
+    id: 'lowpoly',
+    labelKey: 'mono.modes.lowpoly',
+    descriptionKey: 'mono.modes.lowpolyDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'lowpoly',
+    defaultAlgorithmOptions: { density: 0.01, seed: 0 },
+    bandRecipe(i, total) {
+      // Faceted triangulation: dark bands scatter more points → smaller
+      // facets → denser edges; light bands stay coarse.
+      const density = lerp(i, total, 0.04, 0.006)
+      return {
+        algorithm: 'lowpoly',
+        algorithm_options: { density, seed: i * 7 + 13 },
+      }
+    },
+  },
+  {
+    id: 'scribble',
+    labelKey: 'mono.modes.scribble',
+    descriptionKey: 'mono.modes.scribbleDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'scribble',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, amp_mm: 0.59, overshoot_mm: 1.1, angle_deg: 45 },
+    bandRecipe(i, total) {
+      // Loose hand-drawn hatching: tighter spacing on dark bands, plus a
+      // crossing pass on the darkest band — like a sketch shading a shadow.
+      const angles = [45, 135, 0, 90, 30, 150]
+      const angle = angles[i % angles.length] ?? 45
+      const spacing = lerp(i, total, 0.93, 2.4)
+      const finalAngles = i === 0 && total > 1 ? [angle, (angle + 90) % 180] : [angle]
+      return {
+        algorithm: 'scribble',
+        algorithm_options: {
+          angles: finalAngles,
+          spacing_mm: spacing,
+          amp_mm: 0.59,
+          overshoot_mm: 1.1,
+          seed: i * 7 + 13,
+        },
+      }
+    },
+  },
+  // ============== MASTER STYLES — binary (thresholds) ==============
+  {
+    id: 'outline',
+    labelKey: 'mono.modes.outline',
+    descriptionKey: 'mono.modes.outlineDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+      // Line art needs detail: at 800 px the outline trace merges thin
+      // strokes and drops fine features. High tier keeps them.
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'edges',
+    defaultAlgorithmOptions: { stroke_width: 0.8 },
+    bandRecipe() {
+      return { algorithm: 'edges', algorithm_options: { stroke_width: 0.8 } }
+    },
+  },
+  {
+    // Otsu binary segmentation: the backend auto-picks the ink/paper split
+    // from the image histogram (no threshold to tune). Useful for scans,
+    // logos and high-contrast line art where ``outline``'s 0.5 threshold
+    // chops parts of the subject. Fills the dark region with crosshatch
+    // so it reads as a solid ink area rather than a single outline pass.
+    id: 'otsu-binary',
+    labelKey: 'mono.modes.otsuBinary',
+    descriptionKey: 'mono.modes.otsuBinaryDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'otsu',
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+      // Line-art benefits from the higher canvas size, same as ``outline``.
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'crosshatch',
+    defaultAlgorithmOptions: { angle_deg: 45, spacing_mm: 1.1, crossed: false },
+    bandRecipe() {
+      return {
+        algorithm: 'crosshatch',
+        algorithm_options: { angle_deg: 45, spacing_mm: 1.1, crossed: false },
+      }
+    },
+  },
+  {
+    id: 'tsp',
+    labelKey: 'mono.modes.tsp',
+    descriptionKey: 'mono.modes.tspDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'tsp',
+    defaultAlgorithmOptions: { density: 0.04, seed: 0 },
+    bandRecipe() {
+      return { algorithm: 'tsp', algorithm_options: { density: 0.04, seed: 0 } }
+    },
+  },
+  {
+    id: 'spiral-master',
+    labelKey: 'mono.modes.spiral',
+    descriptionKey: 'mono.modes.spiralDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    // Tonal spiral: a single continuous Archimedean spiral over the whole
+    // image whose radial wobble amplitude is modulated *per pixel* from the
+    // source luminance (dark = wide space-filling wobble, light = thin
+    // line). The backend injects the tone map; we therefore segment as a
+    // SINGLE band (one mask = the whole image) so the spiral is one
+    // unbroken stroke. drop_background stays OFF and knob_bands is false —
+    // tone comes from the pixel map, not from band count.
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: false,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'spiral',
+    defaultAlgorithmOptions: {
+      spacing_mm: 5.2,
+      samples_per_turn: 64,
+      wavelength_mm: 3.7,
+      tone_strength: 1,
+    },
+    bandRecipe() {
+      return {
+        algorithm: 'spiral',
+        algorithm_options: {
+          spacing_mm: 5.2,
+          samples_per_turn: 64,
+          wavelength_mm: 3.7,
+          tone_strength: 1,
+        },
+      }
+    },
+  },
+  {
+    id: 'centerline-trace',
+    labelKey: 'mono.modes.centerline',
+    descriptionKey: 'mono.modes.centerlineDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+      // Skeleton tracing on a downscaled canvas fuses nearby strokes
+      // into one centreline; keep the source large so each stroke stays
+      // separable.
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'centerline',
+    defaultAlgorithmOptions: { stroke_width: 0.8, smooth: true, min_branch_mm: 1.1 },
+    bandRecipe() {
+      return {
+        algorithm: 'centerline',
+        algorithm_options: { stroke_width: 0.8, smooth: true, min_branch_mm: 1.1 },
+      }
+    },
+  },
+  {
+    id: 'tsp-optimized',
+    labelKey: 'mono.modes.tspOptimized',
+    descriptionKey: 'mono.modes.tspOptimizedDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'tsp_opt',
+    defaultAlgorithmOptions: {
+      density: 0.04,
+      max_points: 4000,
+      time_budget_s: 1.5,
+      method: 'nn_2opt',
+      poisson_disk: true,
+      seed: 0,
+    },
+    bandRecipe() {
+      return {
+        algorithm: 'tsp_opt',
+        algorithm_options: {
+          density: 0.04,
+          max_points: 4000,
+          time_budget_s: 1.5,
+          method: 'nn_2opt',
+          poisson_disk: true,
+          seed: 0,
+        },
+      }
+    },
+  },
+  {
+    id: 'silhouette',
+    labelKey: 'mono.modes.silhouette',
+    descriptionKey: 'mono.modes.silhouetteDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+      // Solid filled shapes need clean edges; keep the source large so
+      // potrace traces crisp outlines instead of staircased ones.
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'direct',
+    defaultAlgorithmOptions: {},
+    bandRecipe() {
+      return { algorithm: 'direct', algorithm_options: {} }
+    },
+  },
+  // ===== MASTER STYLES — tonal singles (2026-06 expert batches) =====
+  {
+    id: 'ridge-pulsar',
+    labelKey: 'mono.modes.ridgePulsar',
+    descriptionKey: 'mono.modes.ridgePulsarDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'ridge_lines',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, amp_mm: 5.2, smooth_mm: 1.1, occlude: true },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'ridge_lines',
+        algorithm_options: { spacing_mm: 1.9, amp_mm: 5.2, smooth_mm: 1.1, occlude: true },
+      }
+    },
+  },
+  {
+    id: 'dither-print',
+    labelKey: 'mono.modes.ditherPrint',
+    descriptionKey: 'mono.modes.ditherPrintDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'dither',
+    defaultAlgorithmOptions: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'floyd' },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'dither',
+        algorithm_options: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'floyd' },
+      }
+    },
+  },
+  {
+    id: 'etch-burin',
+    labelKey: 'mono.modes.etchBurin',
+    descriptionKey: 'mono.modes.etchBurinDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'etch',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, length_mm: 3.7, jitter: 0.3, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'etch',
+        algorithm_options: { spacing_mm: 1.9, length_mm: 3.7, jitter: 0.3, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'string-thread',
+    labelKey: 'mono.modes.stringThread',
+    descriptionKey: 'mono.modes.stringThreadDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'string_art',
+    defaultAlgorithmOptions: { pegs: 120, lines: 450, fade: 0.22 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return { algorithm: 'string_art', algorithm_options: { pegs: 120, lines: 450, fade: 0.22 } }
+    },
+  },
+  {
+    id: 'hilbert-adaptive',
+    labelKey: 'mono.modes.hilbertAdaptive',
+    descriptionKey: 'mono.modes.hilbertAdaptiveDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'hilbert',
+    defaultAlgorithmOptions: { adaptive: true, spacing_mm: 1.5, min_run_mm: 1.1 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'hilbert',
+        algorithm_options: { adaptive: true, spacing_mm: 1.5, min_run_mm: 1.1 },
+      }
+    },
+  },
+  {
+    id: 'quadtree-mosaic',
+    labelKey: 'mono.modes.quadtreeMosaic',
+    descriptionKey: 'mono.modes.quadtreeMosaicDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'quadtree',
+    defaultAlgorithmOptions: { min_cell_mm: 1.9, split_threshold: 0.1 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'quadtree',
+        algorithm_options: { min_cell_mm: 1.9, split_threshold: 0.1 },
+      }
+    },
+  },
+  {
+    id: 'phyllotaxis-bloom',
+    labelKey: 'mono.modes.phyllotaxisBloom',
+    descriptionKey: 'mono.modes.phyllotaxisBloomDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'phyllotaxis',
+    defaultAlgorithmOptions: { spacing_mm: 2.2, dot_radius_mm: 0.97, outline: false },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'phyllotaxis',
+        algorithm_options: { spacing_mm: 2.2, dot_radius_mm: 0.97, outline: false },
+      }
+    },
+  },
+  {
+    id: 'voronoi-shatter',
+    labelKey: 'mono.modes.voronoiShatter',
+    descriptionKey: 'mono.modes.voronoiShatterDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'voronoi_mosaic',
+    defaultAlgorithmOptions: { density: 0.006, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return { algorithm: 'voronoi_mosaic', algorithm_options: { density: 0.006, seed: 0 } }
+    },
+  },
+  {
+    id: 'text-shading',
+    labelKey: 'mono.modes.textShading',
+    descriptionKey: 'mono.modes.textShadingDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'text_fill',
+    defaultAlgorithmOptions: {
+      text: 'OmniPlot ',
+      font_size_mm: 4.1,
+      line_spacing: 1.2,
+      threshold: 0.3,
+    },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'text_fill',
+        algorithm_options: {
+          text: 'OmniPlot ',
+          font_size_mm: 4.1,
+          line_spacing: 1.2,
+          threshold: 0.3,
+        },
+      }
+    },
+  },
+  {
+    id: 'attractor-smoke',
+    labelKey: 'mono.modes.attractorSmoke',
+    descriptionKey: 'mono.modes.attractorSmokeDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'attractor',
+    defaultAlgorithmOptions: { preset: 'dejong', points: 9000, dot_radius_mm: 0.19, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'attractor',
+        algorithm_options: { preset: 'dejong', points: 9000, dot_radius_mm: 0.19, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'superpixel-paint',
+    labelKey: 'mono.modes.superpixelPaint',
+    descriptionKey: 'mono.modes.superpixelPaintDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'superpixel_hatch',
+    defaultAlgorithmOptions: { regions: 220, spacing_mm: 1.3, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'superpixel_hatch',
+        algorithm_options: { regions: 220, spacing_mm: 1.3, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'noise-topo',
+    labelKey: 'mono.modes.noiseTopo',
+    descriptionKey: 'mono.modes.noiseTopoDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'noise_contours',
+    defaultAlgorithmOptions: { levels: 14, noise_scale: 70, noise_amp: 0.4, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'noise_contours',
+        algorithm_options: { levels: 14, noise_scale: 70, noise_amp: 0.4, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'coral-growth',
+    labelKey: 'mono.modes.coralGrowth',
+    descriptionKey: 'mono.modes.coralGrowthDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'reaction_diffusion',
+    defaultAlgorithmOptions: { pattern: 'spots', steps: 2500, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'reaction_diffusion',
+        algorithm_options: { pattern: 'spots', steps: 2500, seed: 0 },
+      }
+    },
+  },
+  // ===== MASTER STYLES — phase-2 mono batch (2026-06): tonal singles =====
+  // Three tone-aware algorithms that until now only had multicolour
+  // masters. Same contract as the expert tonal singles above: one
+  // luminance band, the injected tone map does the shading.
+  {
+    id: 'schotter-tumble',
+    labelKey: 'mono.modes.schotterTumble',
+    descriptionKey: 'mono.modes.schotterTumbleDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'cubic_disarray',
+    defaultAlgorithmOptions: { cell_mm: 4.5, max_rotate_deg: 35, max_offset_mm: 1.9, seed: 0 },
+    bandRecipe() {
+      // Single tonal band — squares tumble harder where the image is darker.
+      return {
+        algorithm: 'cubic_disarray',
+        algorithm_options: { cell_mm: 4.5, max_rotate_deg: 35, max_offset_mm: 1.9, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'vein-growth',
+    labelKey: 'mono.modes.veinGrowth',
+    descriptionKey: 'mono.modes.veinGrowthDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'space_colonization',
+    defaultAlgorithmOptions: {
+      attractors: 700,
+      step_mm: 1.5,
+      influence_mm: 15,
+      kill_mm: 2.2,
+      seed: 0,
+    },
+    bandRecipe() {
+      // Single tonal band — veins grow toward the dark areas.
+      return {
+        algorithm: 'space_colonization',
+        algorithm_options: {
+          attractors: 700,
+          step_mm: 1.5,
+          influence_mm: 15,
+          kill_mm: 2.2,
+          seed: 0,
+        },
+      }
+    },
+  },
+  {
+    id: 'honeycomb-tone',
+    labelKey: 'mono.modes.honeycombTone',
+    descriptionKey: 'mono.modes.honeycombToneDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'honeycomb',
+    // 'scaled' is the tone-aware mode: hex cells shrink where darker.
+    defaultAlgorithmOptions: { cell_mm: 4.5, mode: 'scaled' },
+    bandRecipe() {
+      return { algorithm: 'honeycomb', algorithm_options: { cell_mm: 4.5, mode: 'scaled' } }
+    },
+  },
+  // ===== MASTER STYLES — phase-2 mono batch (2026-06): banded patterns =====
+  // Generative patterns whose geometry knob (cell / pitch / count) maps
+  // tone naturally: the band recipe lerps it dark→light, so the default
+  // single band renders the pattern at its darkest setting and the
+  // shading slider buys tonal depth band by band.
+  {
+    id: 'truchet-tiles',
+    labelKey: 'mono.modes.truchetTiles',
+    descriptionKey: 'mono.modes.truchetTilesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'truchet',
+    defaultAlgorithmOptions: { cell_mm: 3.7, seed: 0, tile: 'diagonal' },
+    bandRecipe(i, total) {
+      // Smaller tiles read darker; each band re-rolls its own seed.
+      const cell = lerp(i, total, 2.2, 5.2)
+      return {
+        algorithm: 'truchet',
+        algorithm_options: { cell_mm: cell, seed: i * 7 + 13, tile: 'diagonal' },
+      }
+    },
+  },
+  {
+    id: 'maze-walk',
+    labelKey: 'mono.modes.mazeWalk',
+    descriptionKey: 'mono.modes.mazeWalkDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'maze',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+    bandRecipe(i, total) {
+      // Tighter corridors pack more wall ink into the dark bands.
+      const cell = lerp(i, total, 2.2, 4.5)
+      return { algorithm: 'maze', algorithm_options: { cell_mm: cell, seed: i * 7 + 13 } }
+    },
+  },
+  {
+    id: 'basket-weave',
+    labelKey: 'mono.modes.basketWeave',
+    descriptionKey: 'mono.modes.basketWeaveDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'weave',
+    defaultAlgorithmOptions: { band_mm: 4.5, gap_mm: 0.74 },
+    bandRecipe(i, total) {
+      // Narrower ribbons interlace more often — denser weave reads darker.
+      const band = lerp(i, total, 3, 6.7)
+      return { algorithm: 'weave', algorithm_options: { band_mm: band, gap_mm: 0.74 } }
+    },
+  },
+  {
+    id: 'stitch-rows',
+    labelKey: 'mono.modes.stitchRows',
+    descriptionKey: 'mono.modes.stitchRowsDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'hitomezashi',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+    bandRecipe(i, total) {
+      // Finer stitch pitch on the dark bands.
+      const cell = lerp(i, total, 2.2, 4.5)
+      return { algorithm: 'hitomezashi', algorithm_options: { cell_mm: cell, seed: i * 7 + 13 } }
+    },
+  },
+  {
+    id: 'bubble-pack',
+    labelKey: 'mono.modes.bubblePack',
+    descriptionKey: 'mono.modes.bubblePackDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'circle_pack',
+    defaultAlgorithmOptions: { min_radius_mm: 0.45, max_radius_mm: 3, gap_mm: 0.22, seed: 0 },
+    bandRecipe(i, total) {
+      // Smaller bubbles pack more outline ink per area — darker bands
+      // cap the radius low, light bands stay airy.
+      const maxR = lerp(i, total, 1.5, 3.7)
+      const minR = lerp(i, total, 0.3, 0.6)
+      return {
+        algorithm: 'circle_pack',
+        algorithm_options: {
+          min_radius_mm: minR,
+          max_radius_mm: maxR,
+          gap_mm: 0.22,
+          seed: i * 7 + 13,
+        },
+      }
+    },
+  },
+  {
+    id: 'brick-courses',
+    labelKey: 'mono.modes.brickCourses',
+    descriptionKey: 'mono.modes.brickCoursesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'brick',
+    defaultAlgorithmOptions: { brick_w_mm: 5.9, brick_h_mm: 3 },
+    bandRecipe(i, total) {
+      // Shorter courses = more joints per area = darker texture.
+      const h = lerp(i, total, 2.2, 4.5)
+      return { algorithm: 'brick', algorithm_options: { brick_w_mm: h * 2, brick_h_mm: h } }
+    },
+  },
+  {
+    id: 'dash-shading',
+    labelKey: 'mono.modes.dashShading',
+    descriptionKey: 'mono.modes.dashShadingDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'dashes',
+    defaultAlgorithmOptions: {
+      spacing_mm: 1.9,
+      angle_deg: 45,
+      dash_mm: 1.1,
+      gap_mm: 1.1,
+      crossed: false,
+    },
+    bandRecipe(i, total) {
+      // Rotating angle per band like pencil; tighter rows + smaller gaps
+      // pack more dashes into the shadows.
+      const angles = [45, 135, 0, 90]
+      const angle = angles[i % angles.length] ?? 45
+      const spacing = lerp(i, total, 1.1, 2.6)
+      const gap = lerp(i, total, 0.74, 1.9)
+      return {
+        algorithm: 'dashes',
+        algorithm_options: {
+          spacing_mm: spacing,
+          angle_deg: angle,
+          dash_mm: 1.1,
+          gap_mm: gap,
+          crossed: false,
+        },
+      }
+    },
+  },
+  {
+    id: 'vinyl-rings',
+    labelKey: 'mono.modes.vinylRings',
+    descriptionKey: 'mono.modes.vinylRingsDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'rings',
+    defaultAlgorithmOptions: { spacing_mm: 2.2 },
+    bandRecipe(i, total) {
+      // Groove pitch tightens on the dark bands.
+      const spacing = lerp(i, total, 1.1, 3)
+      return { algorithm: 'rings', algorithm_options: { spacing_mm: spacing } }
+    },
+  },
+  {
+    id: 'sunburst-rays',
+    labelKey: 'mono.modes.sunburstRays',
+    descriptionKey: 'mono.modes.sunburstRaysDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'sunburst',
+    defaultAlgorithmOptions: { rays: 120 },
+    bandRecipe(i, total) {
+      // More rays fan into the dark bands.
+      const rays = Math.round(lerp(i, total, 220, 70))
+      return { algorithm: 'sunburst', algorithm_options: { rays } }
+    },
+  },
+  {
+    id: 'thread-fans',
+    labelKey: 'mono.modes.threadFans',
+    descriptionKey: 'mono.modes.threadFansDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'curve_stitching',
+    defaultAlgorithmOptions: { cell_mm: 6.7, chords: 7, seed: 0 },
+    bandRecipe(i, total) {
+      // Smaller cells with more chords per fan read darker.
+      const cell = lerp(i, total, 4.5, 8)
+      const chords = Math.round(lerp(i, total, 9, 5))
+      return {
+        algorithm: 'curve_stitching',
+        algorithm_options: { cell_mm: cell, chords, seed: i * 7 + 13 },
+      }
+    },
+  },
+  {
+    id: 'moire-beat',
+    labelKey: 'mono.modes.moireBeat',
+    descriptionKey: 'mono.modes.moireBeatDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'moire',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+    bandRecipe(i, total) {
+      // Tighter gratings beat into denser fringes on the dark bands.
+      const spacing = lerp(i, total, 1.1, 2.6)
+      return {
+        algorithm: 'moire',
+        algorithm_options: { spacing_mm: spacing, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+      }
+    },
+  },
+  {
+    id: 'penrose-facets',
+    labelKey: 'mono.modes.penroseFacets',
+    descriptionKey: 'mono.modes.penroseFacetsDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'penrose',
+    defaultAlgorithmOptions: { divisions: 6 },
+    bandRecipe(i, total) {
+      // One extra subdivision on the darkest bands — smaller rhombi,
+      // denser edges. (Each division multiplies the tile count, so the
+      // lerp stays in a narrow 5..7 window.)
+      const divisions = Math.round(lerp(i, total, 7, 5))
+      return { algorithm: 'penrose', algorithm_options: { divisions } }
+    },
+  },
+  // ===== MASTER STYLES — phase-2 mono batch (2026-06): binary patterns =====
+  // Pure generative figures with no meaningful tone mapping: the subject
+  // is split from the paper with a plain threshold (same contract as the
+  // binary masters above) and the figure fills the ink region.
+  {
+    id: 'dragon-curve',
+    labelKey: 'mono.modes.dragonCurve',
+    descriptionKey: 'mono.modes.dragonCurveDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lsystem',
+    // iterations 0 = auto depth from the region size.
+    defaultAlgorithmOptions: { preset: 'dragon', iterations: 0 },
+    bandRecipe() {
+      return { algorithm: 'lsystem', algorithm_options: { preset: 'dragon', iterations: 0 } }
+    },
+  },
+  {
+    id: 'chladni-plate',
+    labelKey: 'mono.modes.chladniPlate',
+    descriptionKey: 'mono.modes.chladniPlateDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'chladni',
+    defaultAlgorithmOptions: { m: 3, n: 5, modes: 1 },
+    bandRecipe() {
+      return { algorithm: 'chladni', algorithm_options: { m: 3, n: 5, modes: 1 } }
+    },
+  },
+  {
+    id: 'pendulum-trace',
+    labelKey: 'mono.modes.pendulumTrace',
+    descriptionKey: 'mono.modes.pendulumTraceDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'harmonograph',
+    defaultAlgorithmOptions: { freq_ratio: 2.01, damping: 0.004, turns: 40, seed: 0 },
+    bandRecipe() {
+      return {
+        algorithm: 'harmonograph',
+        algorithm_options: { freq_ratio: 2.01, damping: 0.004, turns: 40, seed: 0 },
+      }
+    },
+  },
+  // ===== MASTER STYLES — variant batch (2026-06): select-option twins =====
+  // Same algorithms, different ``select`` option — each renders a look
+  // distinct enough on paper to deserve its own gallery card. Pure
+  // registry entries: zero backend code.
+  {
+    id: 'fern-growth',
+    labelKey: 'mono.modes.fernGrowth',
+    descriptionKey: 'mono.modes.fernGrowthDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lsystem',
+    defaultAlgorithmOptions: { preset: 'plant', iterations: 0 },
+    bandRecipe() {
+      return { algorithm: 'lsystem', algorithm_options: { preset: 'plant', iterations: 0 } }
+    },
+  },
+  {
+    id: 'koch-island',
+    labelKey: 'mono.modes.kochIsland',
+    descriptionKey: 'mono.modes.kochIslandDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lsystem',
+    defaultAlgorithmOptions: { preset: 'koch', iterations: 0 },
+    bandRecipe() {
+      return { algorithm: 'lsystem', algorithm_options: { preset: 'koch', iterations: 0 } }
+    },
+  },
+  {
+    id: 'sierpinski-sweep',
+    labelKey: 'mono.modes.sierpinskiSweep',
+    descriptionKey: 'mono.modes.sierpinskiSweepDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'thresholds',
+      default_threshold: 0.5,
+      drop_background: true,
+      background_luminance: 0.55,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lsystem',
+    defaultAlgorithmOptions: { preset: 'sierpinski', iterations: 0 },
+    bandRecipe() {
+      return { algorithm: 'lsystem', algorithm_options: { preset: 'sierpinski', iterations: 0 } }
+    },
+  },
+  {
+    id: 'ring-halftone',
+    labelKey: 'mono.modes.ringHalftone',
+    descriptionKey: 'mono.modes.ringHalftoneDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'halftone',
+    // 'ring' glyph: the pen traces hollow circles instead of spiralling
+    // dots solid — same tonal mapping (size ∝ darkness), airier look.
+    defaultAlgorithmOptions: { cell_size_mm: 1.9, glyph: 'ring' },
+    bandRecipe(i, total) {
+      const cell = lerp(i, total, 1.1, 3.3)
+      return { algorithm: 'halftone', algorithm_options: { cell_size_mm: cell, glyph: 'ring' } }
+    },
+  },
+  {
+    id: 'cross-stitch',
+    labelKey: 'mono.modes.crossStitch',
+    descriptionKey: 'mono.modes.crossStitchDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'halftone',
+    defaultAlgorithmOptions: { cell_size_mm: 2.2, glyph: 'cross' },
+    bandRecipe(i, total) {
+      const cell = lerp(i, total, 1.5, 3.7)
+      return { algorithm: 'halftone', algorithm_options: { cell_size_mm: cell, glyph: 'cross' } }
+    },
+  },
+  {
+    id: 'truchet-pipes',
+    labelKey: 'mono.modes.truchetPipes',
+    descriptionKey: 'mono.modes.truchetPipesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'truchet',
+    // 'arc' tiles — the classic Smith quarter-circle pipes.
+    defaultAlgorithmOptions: { cell_mm: 3.7, seed: 0, tile: 'arc' },
+    bandRecipe(i, total) {
+      const cell = lerp(i, total, 2.2, 5.2)
+      return {
+        algorithm: 'truchet',
+        algorithm_options: { cell_mm: cell, seed: i * 7 + 13, tile: 'arc' },
+      }
+    },
+  },
+  {
+    id: 'moire-lines',
+    labelKey: 'mono.modes.moireLines',
+    descriptionKey: 'mono.modes.moireLinesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: true,
+    },
+    defaultAlgorithm: 'moire',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, mode: 'lines', offset_mm: 5.2, delta_deg: 4 },
+    bandRecipe(i, total) {
+      const spacing = lerp(i, total, 1.1, 2.6)
+      return {
+        algorithm: 'moire',
+        algorithm_options: { spacing_mm: spacing, mode: 'lines', offset_mm: 5.2, delta_deg: 4 },
+      }
+    },
+  },
+  {
+    id: 'ridge-radial',
+    labelKey: 'mono.modes.ridgeRadial',
+    descriptionKey: 'mono.modes.ridgeRadialDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'ridge_lines',
+    defaultAlgorithmOptions: {
+      spacing_mm: 1.9,
+      amp_mm: 5.2,
+      smooth_mm: 1.1,
+      occlude: true,
+      layout: 'radial',
+    },
+    bandRecipe() {
+      // Single tonal band — the injected luminance map does the shading.
+      return {
+        algorithm: 'ridge_lines',
+        algorithm_options: {
+          spacing_mm: 1.9,
+          amp_mm: 5.2,
+          smooth_mm: 1.1,
+          occlude: true,
+          layout: 'radial',
+        },
+      }
+    },
+  },
+  {
+    id: 'bayer-print',
+    labelKey: 'mono.modes.bayerPrint',
+    descriptionKey: 'mono.modes.bayerPrintDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'dither',
+    defaultAlgorithmOptions: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'bayer' },
+    bandRecipe() {
+      return {
+        algorithm: 'dither',
+        algorithm_options: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'bayer' },
+      }
+    },
+  },
+  {
+    id: 'wind-field',
+    labelKey: 'mono.modes.windField',
+    descriptionKey: 'mono.modes.windFieldDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'flowfield',
+    // Perlin mode: streamlines ride smooth noise instead of the image
+    // gradient; tone still drives the seed density (tone-aware).
+    defaultAlgorithmOptions: {
+      mode: 'perlin',
+      seed_spacing_mm: 2.2,
+      step_mm: 0.8,
+      max_steps: 800,
+      bidirectional: true,
+      noise_scale: 48,
+      seed: 0,
+    },
+    bandRecipe() {
+      return {
+        algorithm: 'flowfield',
+        algorithm_options: {
+          mode: 'perlin',
+          seed_spacing_mm: 2.2,
+          step_mm: 0.8,
+          max_steps: 800,
+          bidirectional: true,
+          noise_scale: 48,
+          seed: 0,
+        },
+      }
+    },
+  },
+  {
+    id: 'smoke-clifford',
+    labelKey: 'mono.modes.smokeClifford',
+    descriptionKey: 'mono.modes.smokeCliffordDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'attractor',
+    defaultAlgorithmOptions: { preset: 'clifford', points: 9000, dot_radius_mm: 0.19, seed: 0 },
+    bandRecipe() {
+      return {
+        algorithm: 'attractor',
+        algorithm_options: { preset: 'clifford', points: 9000, dot_radius_mm: 0.19, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'turing-stripes',
+    labelKey: 'mono.modes.turingStripes',
+    descriptionKey: 'mono.modes.turingStripesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'reaction_diffusion',
+    defaultAlgorithmOptions: { pattern: 'stripes', steps: 2500, seed: 0 },
+    bandRecipe() {
+      return {
+        algorithm: 'reaction_diffusion',
+        algorithm_options: { pattern: 'stripes', steps: 2500, seed: 0 },
+      }
+    },
+  },
+  // ===== MASTER STYLES — new-algorithm batch (2026-06) =====
+  {
+    id: 'sound-wave',
+    labelKey: 'mono.modes.soundWave',
+    descriptionKey: 'mono.modes.soundWaveDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'sine_halftone',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, amp_mm: 0.74, period_mm: 1.5 },
+    bandRecipe() {
+      // Single tonal band — frequency + amplitude modulation does the shading.
+      return {
+        algorithm: 'sine_halftone',
+        algorithm_options: { spacing_mm: 1.9, amp_mm: 0.74, period_mm: 1.5 },
+      }
+    },
+  },
+  {
+    id: 'ascii-art',
+    labelKey: 'mono.modes.asciiArt',
+    descriptionKey: 'mono.modes.asciiArtDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'ascii_shade',
+    defaultAlgorithmOptions: { cell_mm: 3.7 },
+    bandRecipe() {
+      // Single tonal band — the glyph ramp does the shading.
+      return { algorithm: 'ascii_shade', algorithm_options: { cell_mm: 3.7 } }
+    },
+  },
+  {
+    id: 'lightning',
+    labelKey: 'mono.modes.lightning',
+    descriptionKey: 'mono.modes.lightningDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lichtenberg',
+    defaultAlgorithmOptions: { branches: 24, step_mm: 1.1, seed: 0 },
+    bandRecipe() {
+      return {
+        algorithm: 'lichtenberg',
+        algorithm_options: { branches: 24, step_mm: 1.1, seed: 0 },
+      }
+    },
+  },
+  {
+    id: 'op-art-warp',
+    labelKey: 'mono.modes.opArtWarp',
+    descriptionKey: 'mono.modes.opArtWarpDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'warp_grid',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, strength_mm: 3.7 },
+    bandRecipe() {
+      return { algorithm: 'warp_grid', algorithm_options: { spacing_mm: 1.9, strength_mm: 3.7 } }
+    },
+  },
+  {
+    id: 'fish-scales',
+    labelKey: 'mono.modes.fishScales',
+    descriptionKey: 'mono.modes.fishScalesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'monochrome',
+    segmentation: {
+      method: 'luminance_bands',
+      default_num_bands: 1,
+      drop_background: true,
+      background_luminance: 0.85,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'scallop',
+    defaultAlgorithmOptions: { scale_mm: 4.5 },
+    bandRecipe() {
+      return { algorithm: 'scallop', algorithm_options: { scale_mm: 4.5 } }
+    },
+  },
+  // ============== MASTER STYLES — multicolor ==============
+  // Mirror of the mono master family for multicolour mode: each style
+  // owns its segmentation (kmeans by default) and a ``colorRecipe`` the
+  // composable expands into ``band_recipes`` per detected colour cluster.
+  // The backend's existing band_recipes machinery serves both modes —
+  // recipes are matched by cluster order (darkest first) regardless of
+  // whether segmentation is luminance bands or kmeans clusters.
+  {
+    id: 'color-flat',
+    labelKey: 'colorStyles.flat',
+    descriptionKey: 'colorStyles.flatDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'direct',
+    defaultAlgorithmOptions: {},
+    colorRecipe() {
+      return { algorithm: 'direct', algorithm_options: {} }
+    },
+  },
+  {
+    id: 'color-flat-lab',
+    labelKey: 'colorStyles.flatLab',
+    descriptionKey: 'colorStyles.flatLabDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      // Perceptual k-means: clusters colours in CIE Lab so the few pens
+      // available are spent the way the eye would group the image, not
+      // the way RGB distance happens to fall.
+      method: 'kmeans_lab',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'direct',
+    defaultAlgorithmOptions: {},
+    colorRecipe() {
+      return { algorithm: 'direct', algorithm_options: {} }
+    },
+  },
+  {
+    // Palette-dithered fill: snaps the image to the operator's pen palette
+    // with ordered (Bayer) dithering on top. Lets a small magazine fake
+    // mid-tones — close to half-toning but using whatever pens are
+    // installed. Requires a non-empty palette (Colours block).
+    id: 'color-palette-dither',
+    labelKey: 'colorStyles.paletteDither',
+    descriptionKey: 'colorStyles.paletteDitherDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'palette_dither',
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'direct',
+    defaultAlgorithmOptions: {},
+    colorRecipe() {
+      return { algorithm: 'direct', algorithm_options: {} }
+    },
+  },
+  {
+    id: 'color-crosshatch',
+    labelKey: 'colorStyles.crosshatch',
+    descriptionKey: 'colorStyles.crosshatchDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'crosshatch',
+    defaultAlgorithmOptions: { angle_deg: 45, spacing_mm: 1.5, crossed: false },
+    colorRecipe(i, total) {
+      // Rotate the hatch angle per cluster so overlapping inks read as
+      // distinct strokes. Darkest cluster gets the densest spacing so the
+      // visual weight tracks the source-image luminance. Past the 8-angle
+      // base list a 7.5° shift per wrap keeps 9-16 colour jobs distinct.
+      const angles = [0, 45, 90, 135, 30, 75, 120, 165]
+      const angle = ((angles[i % angles.length] ?? 45) + Math.floor(i / angles.length) * 7.5) % 180
+      const spacing = lerp(i, total, 0.93, 2.2)
+      return {
+        algorithm: 'crosshatch',
+        algorithm_options: { angle_deg: angle, spacing_mm: spacing, crossed: false },
+      }
+    },
+  },
+  {
+    id: 'color-stipple',
+    labelKey: 'colorStyles.stipple',
+    descriptionKey: 'colorStyles.stippleDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'voronoi_stipple',
+    defaultAlgorithmOptions: { density: 0.03, dot_radius_mm: 0.19, iterations: 4, seed: 0 },
+    colorRecipe(i, total) {
+      // Darker clusters get denser dot fields. Voronoi relaxation keeps
+      // spacing even within each cluster so overlapping inks don't clump.
+      const density = lerp(i, total, 0.18, 0.02)
+      return {
+        algorithm: 'voronoi_stipple',
+        algorithm_options: {
+          density,
+          dot_radius_mm: 0.19,
+          iterations: 4,
+          seed: i * 13 + 7,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-halftone-cmyk',
+    labelKey: 'colorStyles.halftoneCmyk',
+    descriptionKey: 'colorStyles.halftoneCmykDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'halftone',
+    defaultAlgorithmOptions: { cell_size_mm: 1.9 },
+    colorRecipe(_i, _total, hex) {
+      // CMYK printing convention: assign canonical screen angles by the
+      // cluster's dominant primary. Falls back to 45° (the black plate
+      // angle) when no single channel dominates. Cell size stays uniform
+      // so the trade-off is colour overlay vs moiré — the classic look.
+      const r = parseInt(hex.slice(1, 3), 16) / 255
+      const g = parseInt(hex.slice(3, 5), 16) / 255
+      const b = parseInt(hex.slice(5, 7), 16) / 255
+      const c = 1 - r,
+        m = 1 - g,
+        y = 1 - b
+      let angle = 45
+      const max = Math.max(c, m, y)
+      if (max > 0.15) {
+        if (max === c) angle = 15
+        else if (max === m) angle = 75
+        else angle = 0 // yellow
+      }
+      return {
+        algorithm: 'halftone',
+        algorithm_options: { cell_size_mm: 1.9, angle_deg: angle },
+      }
+    },
+  },
+  {
+    id: 'color-contours-topo',
+    labelKey: 'colorStyles.contoursTopo',
+    descriptionKey: 'colorStyles.contoursTopoDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'contours',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, max_rings: 20 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 0.93, 2.2)
+      const rings = Math.round(lerp(i, total, 30, 10))
+      return {
+        algorithm: 'contours',
+        algorithm_options: { spacing_mm: spacing, max_rings: rings },
+      }
+    },
+  },
+  {
+    id: 'color-flowfield',
+    labelKey: 'colorStyles.flowfield',
+    descriptionKey: 'colorStyles.flowfieldDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'flowfield',
+    defaultAlgorithmOptions: {
+      seed_spacing_mm: 3,
+      step_mm: 0.3,
+      max_steps: 600,
+      bidirectional: true,
+      noise_scale: 48,
+      mode: 'gradient',
+      seed: 0,
+    },
+    colorRecipe(i, _total) {
+      // Stagger the streamline density per cluster: lighter clusters
+      // get sparser seeds so the overlapping inks don't muddy the
+      // image. Each cluster also gets its own RNG seed so the
+      // streamlines don't trace identical paths just shifted in colour.
+      return {
+        algorithm: 'flowfield',
+        algorithm_options: {
+          seed_spacing_mm: 2.2 + i * 2,
+          step_mm: 0.3,
+          max_steps: 600,
+          bidirectional: true,
+          noise_scale: 48,
+          mode: 'gradient',
+          seed: i * 31 + 11,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-sketch',
+    labelKey: 'colorStyles.sketch',
+    descriptionKey: 'colorStyles.sketchDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.9,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'squiggle',
+    defaultAlgorithmOptions: {
+      spacing_mm: 1.5,
+      amp_mm: 0.52,
+      period_mm: 3,
+      jitter: 0.45,
+      mode: 'modulated',
+      seed: 0,
+    },
+    colorRecipe(i, total) {
+      // Loose, hand-drawn feel: amplitude shrinks for lighter clusters
+      // so the wiggle reads as shading instead of dominant texture.
+      const amp = lerp(i, total, 0.67, 0.22)
+      const spacing = lerp(i, total, 1.1, 2.2)
+      return {
+        algorithm: 'squiggle',
+        algorithm_options: {
+          spacing_mm: spacing,
+          amp_mm: amp,
+          period_mm: 3,
+          jitter: 0.45,
+          mode: 'modulated',
+          seed: i * 17 + 23,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-spiral',
+    labelKey: 'colorStyles.spiral',
+    descriptionKey: 'colorStyles.spiralDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'concentric_offset',
+    defaultAlgorithmOptions: { spacing_mm: 1.1, max_rings: 40, bridge: true },
+    colorRecipe(i, total) {
+      // Tighter rings on the darker cluster, looser on the light side.
+      const spacing = lerp(i, total, 0.74, 1.9)
+      return {
+        algorithm: 'concentric_offset',
+        algorithm_options: { spacing_mm: spacing, max_rings: 40, bridge: true },
+      }
+    },
+  },
+  // ---- Additional colour masters to cover every backend algorithm ----
+  // The layer picker exposes 18 algorithms; the colour master family
+  // mirrors them one-for-one so the operator can pick a multi-colour
+  // preset based on any technique, not just the eight we shipped first.
+  {
+    id: 'color-stippling-classic',
+    labelKey: 'colorStyles.stipplingClassic',
+    descriptionKey: 'colorStyles.stipplingClassicDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'stippling',
+    defaultAlgorithmOptions: { density: 0.03, dot_radius_mm: 0.19, seed: 0 },
+    colorRecipe(i, total) {
+      const density = lerp(i, total, 0.18, 0.02)
+      return {
+        algorithm: 'stippling',
+        algorithm_options: { density, dot_radius_mm: 0.19, seed: i * 7 + 13 },
+      }
+    },
+  },
+  {
+    id: 'color-edges',
+    labelKey: 'colorStyles.edges',
+    descriptionKey: 'colorStyles.edgesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'edges',
+    defaultAlgorithmOptions: { stroke_width: 0.8 },
+    colorRecipe() {
+      return { algorithm: 'edges', algorithm_options: { stroke_width: 0.8 } }
+    },
+  },
+  {
+    id: 'color-centerline',
+    labelKey: 'colorStyles.centerline',
+    descriptionKey: 'colorStyles.centerlineDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+      default_max_dimension_px: 2400,
+    },
+    defaultAlgorithm: 'centerline',
+    defaultAlgorithmOptions: { stroke_width: 0.8, smooth: true, min_branch_mm: 1.1 },
+    colorRecipe() {
+      return {
+        algorithm: 'centerline',
+        algorithm_options: { stroke_width: 0.8, smooth: true, min_branch_mm: 1.1 },
+      }
+    },
+  },
+  {
+    id: 'color-spiral-classic',
+    labelKey: 'colorStyles.spiralClassic',
+    descriptionKey: 'colorStyles.spiralClassicDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'spiral',
+    defaultAlgorithmOptions: { spacing_mm: 1.1, samples_per_turn: 64 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 0.74, 1.9)
+      return {
+        algorithm: 'spiral',
+        algorithm_options: { spacing_mm: spacing, samples_per_turn: 64 },
+      }
+    },
+  },
+  {
+    id: 'color-scanlines',
+    labelKey: 'colorStyles.scanlines',
+    descriptionKey: 'colorStyles.scanlinesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'scanlines',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, wave_amp_mm: 0, wave_period_mm: 4.5 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 0.93, 2.2)
+      return {
+        algorithm: 'scanlines',
+        algorithm_options: { spacing_mm: spacing, wave_amp_mm: 0, wave_period_mm: 4.5 },
+      }
+    },
+  },
+  {
+    id: 'color-tsp',
+    labelKey: 'colorStyles.tsp',
+    descriptionKey: 'colorStyles.tspDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'tsp',
+    defaultAlgorithmOptions: { density: 0.03, seed: 0 },
+    colorRecipe(i, total) {
+      const density = lerp(i, total, 0.12, 0.02)
+      return {
+        algorithm: 'tsp',
+        algorithm_options: { density, seed: i * 11 + 5 },
+      }
+    },
+  },
+  {
+    id: 'color-hilbert',
+    labelKey: 'colorStyles.hilbert',
+    descriptionKey: 'colorStyles.hilbertDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'hilbert',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, min_run_mm: 1.1 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 0.93, 2.2)
+      return {
+        algorithm: 'hilbert',
+        algorithm_options: { spacing_mm: spacing, min_run_mm: 1.1 },
+      }
+    },
+  },
+  {
+    id: 'color-gosper',
+    labelKey: 'colorStyles.gosper',
+    descriptionKey: 'colorStyles.gosperDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'gosper',
+    defaultAlgorithmOptions: { order: 4, spacing_mm: 1.5, rotation_deg: 0 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.1, 1.9)
+      // Rotate per cluster to avoid identical curves stacking exactly.
+      return {
+        algorithm: 'gosper',
+        algorithm_options: { order: 4, spacing_mm: spacing, rotation_deg: (i * 30) % 360 },
+      }
+    },
+  },
+  {
+    id: 'color-eulerian',
+    labelKey: 'colorStyles.eulerian',
+    descriptionKey: 'colorStyles.eulerianDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'eulerian_hatch',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, angle_deg: 45, crossed: false },
+    colorRecipe(i, total) {
+      const angles = [0, 45, 90, 135, 30, 75, 120, 165]
+      // Same 7.5° wrap shift as color-crosshatch for 9-16 colour jobs.
+      const angle = ((angles[i % angles.length] ?? 45) + Math.floor(i / angles.length) * 7.5) % 180
+      const spacing = lerp(i, total, 0.93, 2.2)
+      return {
+        algorithm: 'eulerian_hatch',
+        algorithm_options: { spacing_mm: spacing, angle_deg: angle, crossed: false },
+      }
+    },
+  },
+  {
+    id: 'color-tsp-opt',
+    labelKey: 'colorStyles.tspOpt',
+    descriptionKey: 'colorStyles.tspOptDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'tsp_opt',
+    defaultAlgorithmOptions: {
+      density: 0.06,
+      max_points: 8000,
+      time_budget_s: 2.0,
+      seed: 0,
+      poisson_disk: true,
+    },
+    colorRecipe(i, total) {
+      const density = lerp(i, total, 0.12, 0.02)
+      return {
+        algorithm: 'tsp_opt',
+        algorithm_options: {
+          density,
+          max_points: 8000,
+          time_budget_s: 2.0,
+          seed: i * 19 + 3,
+          poisson_disk: true,
+        },
+      }
+    },
+  },
+
+  // ---- Geometric / generative colour masters ----
+  // Texture fills with a strong graphic identity. Each defines a
+  // ``colorRecipe`` so the multicolour pipeline can expand it per
+  // cluster without a MULTICOLOR_STYLE_DEFAULTS entry (the composable
+  // falls back to the recipe when no knob set is registered).
+  {
+    id: 'color-grid',
+    labelKey: 'colorStyles.grid',
+    descriptionKey: 'colorStyles.gridDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'grid',
+    defaultAlgorithmOptions: { spacing_mm: 1.9 },
+    colorRecipe(i, total) {
+      // Darker clusters get a tighter mesh so visual weight tracks the
+      // source luminance.
+      const spacing = lerp(i, total, 1.1, 2.6)
+      return { algorithm: 'grid', algorithm_options: { spacing_mm: spacing } }
+    },
+  },
+  {
+    id: 'color-brick',
+    labelKey: 'colorStyles.brick',
+    descriptionKey: 'colorStyles.brickDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'brick',
+    defaultAlgorithmOptions: { brick_w_mm: 5.9, brick_h_mm: 3 },
+    colorRecipe(i, total) {
+      // Smaller bricks (denser mortar) on darker clusters.
+      const h = Math.round(lerp(i, total, 2.2, 4.5) * 10) / 10
+      return {
+        algorithm: 'brick',
+        algorithm_options: { brick_w_mm: h * 2, brick_h_mm: h },
+      }
+    },
+  },
+  {
+    id: 'color-dashes',
+    labelKey: 'colorStyles.dashes',
+    descriptionKey: 'colorStyles.dashesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 5,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'dashes',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, angle_deg: 45, dash_mm: 1.1, gap_mm: 1.1 },
+    colorRecipe(i, total) {
+      // Rotate the dash angle per cluster (like the crosshatch master) so
+      // overlapping inks read as distinct stitch directions, with the
+      // same 7.5° wrap shift past eight clusters.
+      const angles = [0, 45, 90, 135, 30, 75, 120, 165]
+      const angle = ((angles[i % angles.length] ?? 45) + Math.floor(i / angles.length) * 7.5) % 180
+      const spacing = lerp(i, total, 1.1, 2.2)
+      return {
+        algorithm: 'dashes',
+        algorithm_options: { spacing_mm: spacing, angle_deg: angle, dash_mm: 1.1, gap_mm: 1.1 },
+      }
+    },
+  },
+  {
+    id: 'color-truchet',
+    labelKey: 'colorStyles.truchet',
+    descriptionKey: 'colorStyles.truchetDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'truchet',
+    defaultAlgorithmOptions: { cell_mm: 3.7, seed: 0 },
+    colorRecipe(i, total) {
+      // Finer tiles on darker clusters; per-cluster seed so the random
+      // diagonals don't line up identically across inks.
+      const cell = Math.round(lerp(i, total, 2.6, 5.2) * 10) / 10
+      return {
+        algorithm: 'truchet',
+        algorithm_options: { cell_mm: cell, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-rings',
+    labelKey: 'colorStyles.rings',
+    descriptionKey: 'colorStyles.ringsDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'rings',
+    defaultAlgorithmOptions: { spacing_mm: 2.2 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.5, 3)
+      return { algorithm: 'rings', algorithm_options: { spacing_mm: spacing } }
+    },
+  },
+  {
+    id: 'color-sunburst',
+    labelKey: 'colorStyles.sunburst',
+    descriptionKey: 'colorStyles.sunburstDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'sunburst',
+    defaultAlgorithmOptions: { rays: 120 },
+    colorRecipe(i, total) {
+      // Denser ray fan on darker clusters.
+      const rays = Math.round(lerp(i, total, 160, 60))
+      return { algorithm: 'sunburst', algorithm_options: { rays } }
+    },
+  },
+  {
+    id: 'color-circle-pack',
+    labelKey: 'colorStyles.circlePack',
+    descriptionKey: 'colorStyles.circlePackDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'circle_pack',
+    defaultAlgorithmOptions: { min_radius_mm: 0.37, max_radius_mm: 2.6, gap_mm: 0.22, seed: 0 },
+    colorRecipe(i, total) {
+      // Smaller bubbles on darker clusters → denser ink coverage. Attempts
+      // auto-scale with region area on the backend, so the packing fills.
+      const maxR = lerp(i, total, 1.1, 2.6)
+      return {
+        algorithm: 'circle_pack',
+        algorithm_options: {
+          min_radius_mm: 0.37,
+          max_radius_mm: maxR,
+          gap_mm: 0.22,
+          seed: i * 17 + 5,
+        },
+      }
+    },
+  },
+
+  // ===== MASTER STYLES — multicolor (2026-06 expert batches) =====
+  {
+    id: 'color-ridge-lines',
+    labelKey: 'colorStyles.ridgeLines',
+    descriptionKey: 'colorStyles.ridgeLinesDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'ridge_lines',
+    defaultAlgorithmOptions: { spacing_mm: 2.2, amp_mm: 3.7, smooth_mm: 1.1, occlude: true },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.5, 3)
+      return {
+        algorithm: 'ridge_lines',
+        algorithm_options: { spacing_mm: spacing, amp_mm: 3.7, smooth_mm: 1.1, occlude: true },
+      }
+    },
+  },
+  {
+    id: 'color-hitomezashi',
+    labelKey: 'colorStyles.hitomezashi',
+    descriptionKey: 'colorStyles.hitomezashiDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'hitomezashi',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+    colorRecipe(i, total) {
+      const cell = Math.round(lerp(i, total, 2.2, 4.5) * 10) / 10
+      return { algorithm: 'hitomezashi', algorithm_options: { cell_mm: cell, seed: i * 13 + 7 } }
+    },
+  },
+  {
+    id: 'color-cubic-disarray',
+    labelKey: 'colorStyles.cubicDisarray',
+    descriptionKey: 'colorStyles.cubicDisarrayDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'cubic_disarray',
+    defaultAlgorithmOptions: { cell_mm: 4.5, max_rotate_deg: 35, max_offset_mm: 1.9, seed: 0 },
+    colorRecipe(i, total) {
+      const cell = Math.round(lerp(i, total, 3.7, 5.9) * 10) / 10
+      return {
+        algorithm: 'cubic_disarray',
+        algorithm_options: {
+          cell_mm: cell,
+          max_rotate_deg: 35,
+          max_offset_mm: 1.9,
+          seed: i * 13 + 7,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-quadtree',
+    labelKey: 'colorStyles.quadtree',
+    descriptionKey: 'colorStyles.quadtreeDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'quadtree',
+    defaultAlgorithmOptions: { min_cell_mm: 2.2, split_threshold: 0.12 },
+    colorRecipe(i, total) {
+      const minCell = Math.round(lerp(i, total, 1.5, 3.7) * 10) / 10
+      return {
+        algorithm: 'quadtree',
+        algorithm_options: { min_cell_mm: minCell, split_threshold: 0.12 },
+      }
+    },
+  },
+  {
+    id: 'color-maze',
+    labelKey: 'colorStyles.maze',
+    descriptionKey: 'colorStyles.mazeDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'maze',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+    colorRecipe(i, total) {
+      const cell = Math.round(lerp(i, total, 2.2, 4.5) * 10) / 10
+      return { algorithm: 'maze', algorithm_options: { cell_mm: cell, seed: i * 13 + 7 } }
+    },
+  },
+  {
+    id: 'color-phyllotaxis',
+    labelKey: 'colorStyles.phyllotaxis',
+    descriptionKey: 'colorStyles.phyllotaxisDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'phyllotaxis',
+    defaultAlgorithmOptions: { spacing_mm: 2.6, dot_radius_mm: 0.93, outline: false },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.9, 3.3)
+      return {
+        algorithm: 'phyllotaxis',
+        algorithm_options: { spacing_mm: spacing, dot_radius_mm: 0.93, outline: false },
+      }
+    },
+  },
+  {
+    id: 'color-voronoi-mosaic',
+    labelKey: 'colorStyles.voronoiMosaic',
+    descriptionKey: 'colorStyles.voronoiMosaicDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'voronoi_mosaic',
+    defaultAlgorithmOptions: { density: 0.004, seed: 0 },
+    colorRecipe(i, total) {
+      const density = lerp(i, total, 0.008, 0.002)
+      return { algorithm: 'voronoi_mosaic', algorithm_options: { density, seed: i * 13 + 7 } }
+    },
+  },
+  {
+    id: 'color-curve-stitching',
+    labelKey: 'colorStyles.curveStitching',
+    descriptionKey: 'colorStyles.curveStitchingDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'curve_stitching',
+    defaultAlgorithmOptions: { cell_mm: 6.7, chords: 7, seed: 0 },
+    colorRecipe(i, total) {
+      const chords = Math.round(lerp(i, total, 10, 5))
+      return {
+        algorithm: 'curve_stitching',
+        algorithm_options: { cell_mm: 6.7, chords, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-string-art',
+    labelKey: 'colorStyles.stringArt',
+    descriptionKey: 'colorStyles.stringArtDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'string_art',
+    defaultAlgorithmOptions: { pegs: 96, lines: 350, fade: 0.25 },
+    colorRecipe(i, total) {
+      const lines = Math.round(lerp(i, total, 500, 200))
+      return { algorithm: 'string_art', algorithm_options: { pegs: 96, lines, fade: 0.25 } }
+    },
+  },
+  {
+    id: 'color-space-colonization',
+    labelKey: 'colorStyles.spaceColonization',
+    descriptionKey: 'colorStyles.spaceColonizationDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'space_colonization',
+    defaultAlgorithmOptions: {
+      attractors: 700,
+      step_mm: 1.5,
+      influence_mm: 15,
+      kill_mm: 2.2,
+      seed: 0,
+    },
+    colorRecipe(i, total) {
+      const attractors = Math.round(lerp(i, total, 1200, 400))
+      return {
+        algorithm: 'space_colonization',
+        algorithm_options: {
+          attractors,
+          step_mm: 1.5,
+          influence_mm: 15,
+          kill_mm: 2.2,
+          seed: i * 13 + 7,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-penrose',
+    labelKey: 'colorStyles.penrose',
+    descriptionKey: 'colorStyles.penroseDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'penrose',
+    defaultAlgorithmOptions: { divisions: 6 },
+    colorRecipe(i, total) {
+      const divisions = Math.round(lerp(i, total, 7, 5))
+      return { algorithm: 'penrose', algorithm_options: { divisions } }
+    },
+  },
+  {
+    id: 'color-dither',
+    labelKey: 'colorStyles.dither',
+    descriptionKey: 'colorStyles.ditherDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'dither',
+    defaultAlgorithmOptions: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'floyd' },
+    colorRecipe(i, total) {
+      const cell = Math.round(lerp(i, total, 1.1, 2.2) * 10) / 10
+      return {
+        algorithm: 'dither',
+        algorithm_options: { cell_mm: cell, dot_radius_mm: 0.37, method: 'floyd' },
+      }
+    },
+  },
+  {
+    id: 'color-etch',
+    labelKey: 'colorStyles.etch',
+    descriptionKey: 'colorStyles.etchDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'etch',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, length_mm: 3.3, jitter: 0.3, seed: 0 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.5, 2.6)
+      return {
+        algorithm: 'etch',
+        algorithm_options: { spacing_mm: spacing, length_mm: 3.3, jitter: 0.3, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-noise-contours',
+    labelKey: 'colorStyles.noiseContours',
+    descriptionKey: 'colorStyles.noiseContoursDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'noise_contours',
+    defaultAlgorithmOptions: { levels: 12, noise_scale: 60, noise_amp: 0.35, seed: 0 },
+    colorRecipe(i, total) {
+      const levels = Math.round(lerp(i, total, 16, 8))
+      return {
+        algorithm: 'noise_contours',
+        algorithm_options: { levels, noise_scale: 60, noise_amp: 0.35, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-reaction-diffusion',
+    labelKey: 'colorStyles.reactionDiffusion',
+    descriptionKey: 'colorStyles.reactionDiffusionDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'reaction_diffusion',
+    defaultAlgorithmOptions: { pattern: 'spots', steps: 2500, seed: 0 },
+    colorRecipe(i, _total) {
+      return {
+        algorithm: 'reaction_diffusion',
+        algorithm_options: {
+          pattern: i % 2 === 0 ? 'spots' : 'stripes',
+          steps: 2200,
+          seed: i * 13 + 7,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-superpixel-hatch',
+    labelKey: 'colorStyles.superpixelHatch',
+    descriptionKey: 'colorStyles.superpixelHatchDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'superpixel_hatch',
+    defaultAlgorithmOptions: { regions: 180, spacing_mm: 1.5, seed: 0 },
+    colorRecipe(i, total) {
+      const regions = Math.round(lerp(i, total, 260, 120))
+      return {
+        algorithm: 'superpixel_hatch',
+        algorithm_options: { regions, spacing_mm: 1.5, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-moire',
+    labelKey: 'colorStyles.moire',
+    descriptionKey: 'colorStyles.moireDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'moire',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+    colorRecipe(i, total) {
+      const spacing = lerp(i, total, 1.5, 2.6)
+      return {
+        algorithm: 'moire',
+        algorithm_options: { spacing_mm: spacing, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+      }
+    },
+  },
+  {
+    id: 'color-weave',
+    labelKey: 'colorStyles.weave',
+    descriptionKey: 'colorStyles.weaveDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'weave',
+    defaultAlgorithmOptions: { band_mm: 4.5, gap_mm: 0.74 },
+    colorRecipe(i, total) {
+      const band = Math.round(lerp(i, total, 3.7, 5.9) * 10) / 10
+      return { algorithm: 'weave', algorithm_options: { band_mm: band, gap_mm: 0.74 } }
+    },
+  },
+  {
+    id: 'color-honeycomb',
+    labelKey: 'colorStyles.honeycomb',
+    descriptionKey: 'colorStyles.honeycombDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'honeycomb',
+    defaultAlgorithmOptions: { cell_mm: 4.5, mode: 'grid' },
+    colorRecipe(i, total) {
+      const cell = Math.round(lerp(i, total, 3, 5.9) * 10) / 10
+      return { algorithm: 'honeycomb', algorithm_options: { cell_mm: cell, mode: 'grid' } }
+    },
+  },
+  {
+    id: 'color-harmonograph',
+    labelKey: 'colorStyles.harmonograph',
+    descriptionKey: 'colorStyles.harmonographDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'harmonograph',
+    defaultAlgorithmOptions: { freq_ratio: 2.01, damping: 0.004, turns: 40, seed: 0 },
+    colorRecipe(i, total) {
+      const turns = Math.round(lerp(i, total, 60, 25))
+      return {
+        algorithm: 'harmonograph',
+        algorithm_options: { freq_ratio: 2.01, damping: 0.004, turns, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-attractor',
+    labelKey: 'colorStyles.attractor',
+    descriptionKey: 'colorStyles.attractorDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'attractor',
+    defaultAlgorithmOptions: { preset: 'dejong', points: 6000, dot_radius_mm: 0.19, seed: 0 },
+    colorRecipe(i, total) {
+      const points = Math.round(lerp(i, total, 9000, 4000))
+      return {
+        algorithm: 'attractor',
+        algorithm_options: { preset: 'dejong', points, dot_radius_mm: 0.19, seed: i * 13 + 7 },
+      }
+    },
+  },
+  {
+    id: 'color-text-fill',
+    labelKey: 'colorStyles.textFill',
+    descriptionKey: 'colorStyles.textFillDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'text_fill',
+    defaultAlgorithmOptions: {
+      text: 'OmniPlot ',
+      font_size_mm: 4.5,
+      line_spacing: 1.25,
+      threshold: 0,
+    },
+    colorRecipe(i, total) {
+      const size = Math.round(lerp(i, total, 3.7, 5.9) * 10) / 10
+      return {
+        algorithm: 'text_fill',
+        algorithm_options: {
+          text: 'OmniPlot ',
+          font_size_mm: size,
+          line_spacing: 1.25,
+          threshold: 0,
+        },
+      }
+    },
+  },
+  {
+    id: 'color-lsystem',
+    labelKey: 'colorStyles.lsystem',
+    descriptionKey: 'colorStyles.lsystemDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'lsystem',
+    defaultAlgorithmOptions: { preset: 'dragon', iterations: 0 },
+    colorRecipe(i, _total) {
+      const presets = ['dragon', 'sierpinski', 'koch', 'plant']
+      return {
+        algorithm: 'lsystem',
+        algorithm_options: { preset: presets[i % presets.length]!, iterations: 0 },
+      }
+    },
+  },
+  {
+    id: 'color-chladni',
+    labelKey: 'colorStyles.chladni',
+    descriptionKey: 'colorStyles.chladniDesc',
+    applicableTo: ['image'],
+    scope: 'master',
+    mode: 'multicolor',
+    segmentation: {
+      method: 'kmeans',
+      default_num_colors: 4,
+      drop_background: true,
+      background_luminance: 0.92,
+      knob_bands: false,
+    },
+    defaultAlgorithm: 'chladni',
+    defaultAlgorithmOptions: { m: 3, n: 5, modes: 1 },
+    colorRecipe(i, _total) {
+      return {
+        algorithm: 'chladni',
+        algorithm_options: { m: 2 + (i % 4), n: 4 + (i % 5), modes: 1 },
+      }
+    },
+  },
+  // ============== LAYER STYLES — per-layer presets ==============
+  {
+    id: 'direct',
+    labelKey: 'printStyles.direct',
+    descriptionKey: 'printStyles.directDesc',
+    applicableTo: ['image', 'schematic', 'text'],
+    scope: 'layer',
+    defaultAlgorithm: 'direct',
+    defaultAlgorithmOptions: {},
+  },
+  {
+    id: 'halftone-fine',
+    labelKey: 'printStyles.halftoneFine',
+    descriptionKey: 'printStyles.halftoneFineDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'halftone',
+    defaultAlgorithmOptions: { cell_size_mm: 1.5 },
+  },
+  {
+    id: 'halftone-coarse',
+    labelKey: 'printStyles.halftoneCoarse',
+    descriptionKey: 'printStyles.halftoneCoarseDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'halftone',
+    defaultAlgorithmOptions: { cell_size_mm: 3.7 },
+  },
+  {
+    id: 'stippling-portrait',
+    labelKey: 'printStyles.stippling',
+    descriptionKey: 'printStyles.stipplingDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'stippling',
+    defaultAlgorithmOptions: { density: 0.03, dot_radius_mm: 0.19, seed: 0 },
+  },
+  {
+    id: 'crosshatch-tech',
+    labelKey: 'printStyles.crosshatch',
+    descriptionKey: 'printStyles.crosshatchDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'crosshatch',
+    defaultAlgorithmOptions: { angle_deg: 45, spacing_mm: 1.5, crossed: true },
+  },
+  {
+    id: 'contours',
+    labelKey: 'printStyles.contours',
+    descriptionKey: 'printStyles.contoursDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'contours',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, max_rings: 20 },
+  },
+  {
+    id: 'edges',
+    labelKey: 'printStyles.edges',
+    descriptionKey: 'printStyles.edgesDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'edges',
+    defaultAlgorithmOptions: { stroke_width: 0.8 },
+  },
+  {
+    id: 'spiral',
+    labelKey: 'printStyles.spiral',
+    descriptionKey: 'printStyles.spiralDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'spiral',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, samples_per_turn: 64 },
+  },
+  {
+    id: 'scanlines',
+    labelKey: 'printStyles.scanlines',
+    descriptionKey: 'printStyles.scanlinesDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'scanlines',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, wave_amp_mm: 0, wave_period_mm: 4.5 },
+  },
+  {
+    id: 'centerline-stroke',
+    labelKey: 'printStyles.centerline',
+    descriptionKey: 'printStyles.centerlineDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'centerline',
+    defaultAlgorithmOptions: { stroke_width: 0.8, smooth: true, min_branch_mm: 1.1 },
+  },
+  {
+    id: 'voronoi-stipple',
+    labelKey: 'printStyles.voronoiStipple',
+    descriptionKey: 'printStyles.voronoiStippleDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'voronoi_stipple',
+    defaultAlgorithmOptions: { density: 0.03, dot_radius_mm: 0.19, iterations: 6, seed: 0 },
+  },
+  {
+    id: 'squiggle',
+    labelKey: 'printStyles.squiggle',
+    descriptionKey: 'printStyles.squiggleDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'squiggle',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, amp_mm: 0.52, period_mm: 3, jitter: 0.4, seed: 0 },
+  },
+  {
+    id: 'flowfield',
+    labelKey: 'printStyles.flowfield',
+    descriptionKey: 'printStyles.flowfieldDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'flowfield',
+    defaultAlgorithmOptions: {
+      seed_spacing_mm: 2.2,
+      step_mm: 0.3,
+      max_steps: 800,
+      bidirectional: true,
+      noise_scale: 32,
+      seed: 0,
+    },
+  },
+  {
+    id: 'hilbert',
+    labelKey: 'printStyles.hilbert',
+    descriptionKey: 'printStyles.hilbertDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'hilbert',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, min_run_mm: 1.1 },
+  },
+  {
+    id: 'gosper',
+    labelKey: 'printStyles.gosper',
+    descriptionKey: 'printStyles.gosperDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'gosper',
+    defaultAlgorithmOptions: { order: 4, spacing_mm: 1.5, rotation_deg: 0 },
+  },
+  {
+    id: 'eulerian-hatch',
+    labelKey: 'printStyles.eulerianHatch',
+    descriptionKey: 'printStyles.eulerianHatchDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'eulerian_hatch',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, angle_deg: 45, crossed: false },
+  },
+  {
+    id: 'concentric-offset',
+    labelKey: 'printStyles.concentricOffset',
+    descriptionKey: 'printStyles.concentricOffsetDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'concentric_offset',
+    defaultAlgorithmOptions: { spacing_mm: 1.1, max_rings: 50, bridge: true },
+  },
+  {
+    id: 'tsp-opt',
+    labelKey: 'printStyles.tspOpt',
+    descriptionKey: 'printStyles.tspOptDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'tsp_opt',
+    defaultAlgorithmOptions: {
+      density: 0.06,
+      max_points: 8000,
+      time_budget_s: 2.0,
+      seed: 0,
+      poisson_disk: true,
+    },
+  },
+  {
+    id: 'grid',
+    labelKey: 'printStyles.grid',
+    descriptionKey: 'printStyles.gridDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'grid',
+    defaultAlgorithmOptions: { spacing_mm: 2.2 },
+  },
+  {
+    id: 'brick',
+    labelKey: 'printStyles.brick',
+    descriptionKey: 'printStyles.brickDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'brick',
+    defaultAlgorithmOptions: { brick_w_mm: 5.9, brick_h_mm: 3 },
+  },
+  {
+    id: 'dashes',
+    labelKey: 'printStyles.dashes',
+    descriptionKey: 'printStyles.dashesDesc',
+    applicableTo: ['image', 'schematic'],
+    scope: 'layer',
+    defaultAlgorithm: 'dashes',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, angle_deg: 45, dash_mm: 1.1, gap_mm: 1.1 },
+  },
+  {
+    id: 'truchet',
+    labelKey: 'printStyles.truchet',
+    descriptionKey: 'printStyles.truchetDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'truchet',
+    defaultAlgorithmOptions: { cell_mm: 3.7, seed: 0 },
+  },
+  {
+    id: 'rings',
+    labelKey: 'printStyles.rings',
+    descriptionKey: 'printStyles.ringsDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'rings',
+    defaultAlgorithmOptions: { spacing_mm: 2.2 },
+  },
+  {
+    id: 'sunburst',
+    labelKey: 'printStyles.sunburst',
+    descriptionKey: 'printStyles.sunburstDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'sunburst',
+    defaultAlgorithmOptions: { rays: 120 },
+  },
+  {
+    id: 'circle-pack',
+    labelKey: 'printStyles.circlePack',
+    descriptionKey: 'printStyles.circlePackDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'circle_pack',
+    defaultAlgorithmOptions: { min_radius_mm: 0.37, max_radius_mm: 2.6, gap_mm: 0.22, seed: 0 },
+  },
+  // ===== LAYER STYLES — 2026-06 expert batches =====
+  {
+    id: 'ridge-lines',
+    labelKey: 'printStyles.ridgeLines',
+    descriptionKey: 'printStyles.ridgeLinesDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'ridge_lines',
+    defaultAlgorithmOptions: {
+      spacing_mm: 2.2,
+      amp_mm: 3.7,
+      smooth_mm: 1.1,
+      occlude: true,
+      layout: 'rows',
+    },
+  },
+  {
+    id: 'hitomezashi',
+    labelKey: 'printStyles.hitomezashi',
+    descriptionKey: 'printStyles.hitomezashiDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'hitomezashi',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+  },
+  {
+    id: 'cubic-disarray',
+    labelKey: 'printStyles.cubicDisarray',
+    descriptionKey: 'printStyles.cubicDisarrayDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'cubic_disarray',
+    defaultAlgorithmOptions: { cell_mm: 4.5, max_rotate_deg: 35, max_offset_mm: 1.9, seed: 0 },
+  },
+  {
+    id: 'quadtree-blocks',
+    labelKey: 'printStyles.quadtree',
+    descriptionKey: 'printStyles.quadtreeDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'quadtree',
+    defaultAlgorithmOptions: { min_cell_mm: 2.2, split_threshold: 0.12 },
+  },
+  {
+    id: 'maze',
+    labelKey: 'printStyles.maze',
+    descriptionKey: 'printStyles.mazeDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'maze',
+    defaultAlgorithmOptions: { cell_mm: 3, seed: 0 },
+  },
+  {
+    id: 'phyllotaxis',
+    labelKey: 'printStyles.phyllotaxis',
+    descriptionKey: 'printStyles.phyllotaxisDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'phyllotaxis',
+    defaultAlgorithmOptions: { spacing_mm: 2.6, dot_radius_mm: 0.93, outline: false },
+  },
+  {
+    id: 'voronoi-mosaic',
+    labelKey: 'printStyles.voronoiMosaic',
+    descriptionKey: 'printStyles.voronoiMosaicDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'voronoi_mosaic',
+    defaultAlgorithmOptions: { density: 0.004, seed: 0 },
+  },
+  {
+    id: 'curve-stitching',
+    labelKey: 'printStyles.curveStitching',
+    descriptionKey: 'printStyles.curveStitchingDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'curve_stitching',
+    defaultAlgorithmOptions: { cell_mm: 6.7, chords: 7, seed: 0 },
+  },
+  {
+    id: 'string-art',
+    labelKey: 'printStyles.stringArt',
+    descriptionKey: 'printStyles.stringArtDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'string_art',
+    defaultAlgorithmOptions: { pegs: 96, lines: 350, fade: 0.25 },
+  },
+  {
+    id: 'space-colonization',
+    labelKey: 'printStyles.spaceColonization',
+    descriptionKey: 'printStyles.spaceColonizationDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'space_colonization',
+    defaultAlgorithmOptions: {
+      attractors: 700,
+      step_mm: 1.5,
+      influence_mm: 15,
+      kill_mm: 2.2,
+      seed: 0,
+    },
+  },
+  {
+    id: 'penrose',
+    labelKey: 'printStyles.penrose',
+    descriptionKey: 'printStyles.penroseDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'penrose',
+    defaultAlgorithmOptions: { divisions: 6 },
+  },
+  {
+    id: 'dither-retro',
+    labelKey: 'printStyles.dither',
+    descriptionKey: 'printStyles.ditherDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'dither',
+    defaultAlgorithmOptions: { cell_mm: 1.5, dot_radius_mm: 0.37, method: 'floyd' },
+  },
+  {
+    id: 'etch-strokes',
+    labelKey: 'printStyles.etch',
+    descriptionKey: 'printStyles.etchDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'etch',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, length_mm: 3.3, jitter: 0.3, seed: 0 },
+  },
+  {
+    id: 'noise-contours',
+    labelKey: 'printStyles.noiseContours',
+    descriptionKey: 'printStyles.noiseContoursDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'noise_contours',
+    defaultAlgorithmOptions: { levels: 12, noise_scale: 60, noise_amp: 0.35, seed: 0 },
+  },
+  {
+    id: 'reaction-diffusion',
+    labelKey: 'printStyles.reactionDiffusion',
+    descriptionKey: 'printStyles.reactionDiffusionDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'reaction_diffusion',
+    defaultAlgorithmOptions: { pattern: 'spots', steps: 2500, seed: 0 },
+  },
+  {
+    id: 'superpixel-hatch',
+    labelKey: 'printStyles.superpixelHatch',
+    descriptionKey: 'printStyles.superpixelHatchDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'superpixel_hatch',
+    defaultAlgorithmOptions: { regions: 180, spacing_mm: 1.5, seed: 0 },
+  },
+  {
+    id: 'moire',
+    labelKey: 'printStyles.moire',
+    descriptionKey: 'printStyles.moireDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'moire',
+    defaultAlgorithmOptions: { spacing_mm: 1.9, mode: 'rings', offset_mm: 5.2, delta_deg: 4 },
+  },
+  {
+    id: 'weave',
+    labelKey: 'printStyles.weave',
+    descriptionKey: 'printStyles.weaveDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'weave',
+    defaultAlgorithmOptions: { band_mm: 4.5, gap_mm: 0.74 },
+  },
+  {
+    id: 'honeycomb',
+    labelKey: 'printStyles.honeycomb',
+    descriptionKey: 'printStyles.honeycombDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'honeycomb',
+    defaultAlgorithmOptions: { cell_mm: 4.5, mode: 'grid' },
+  },
+  {
+    id: 'harmonograph',
+    labelKey: 'printStyles.harmonograph',
+    descriptionKey: 'printStyles.harmonographDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'harmonograph',
+    defaultAlgorithmOptions: { freq_ratio: 2.01, damping: 0.004, turns: 40, seed: 0 },
+  },
+  {
+    id: 'attractor',
+    labelKey: 'printStyles.attractor',
+    descriptionKey: 'printStyles.attractorDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'attractor',
+    defaultAlgorithmOptions: { preset: 'dejong', points: 6000, dot_radius_mm: 0.19, seed: 0 },
+  },
+  {
+    id: 'text-fill',
+    labelKey: 'printStyles.textFill',
+    descriptionKey: 'printStyles.textFillDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'text_fill',
+    defaultAlgorithmOptions: {
+      text: 'OmniPlot ',
+      font_size_mm: 4.5,
+      line_spacing: 1.25,
+      threshold: 0.35,
+    },
+  },
+  {
+    id: 'lsystem-dragon',
+    labelKey: 'printStyles.lsystem',
+    descriptionKey: 'printStyles.lsystemDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'lsystem',
+    defaultAlgorithmOptions: { preset: 'dragon', iterations: 0 },
+  },
+  {
+    id: 'chladni',
+    labelKey: 'printStyles.chladni',
+    descriptionKey: 'printStyles.chladniDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'chladni',
+    defaultAlgorithmOptions: { m: 3, n: 5, modes: 1 },
+  },
+  {
+    id: 'lowpoly-wireframe',
+    labelKey: 'printStyles.lowpoly',
+    descriptionKey: 'printStyles.lowpolyDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'lowpoly',
+    defaultAlgorithmOptions: { density: 0.02, seed: 0 },
+  },
+  {
+    id: 'scribble-sketch',
+    labelKey: 'printStyles.scribbleSketch',
+    descriptionKey: 'printStyles.scribbleSketchDesc',
+    applicableTo: ['image'],
+    scope: 'layer',
+    defaultAlgorithm: 'scribble',
+    defaultAlgorithmOptions: { spacing_mm: 1.5, amp_mm: 0.59, overshoot_mm: 1.1, seed: 0 },
+  },
+]
+
+// Default master style applied when the operator first switches to
+// monochrome — pencil is the friendliest general-purpose choice for
+// photographs.
+export const DEFAULT_MASTER_STYLE_ID = 'pencil'
+
+// Default master style applied when the operator switches to
+// multicolour. Flat aplats are the most predictable starting point —
+// the operator can then promote to crosshatch / stipple / halftone via
+// the picker once they see the cluster layout.
+export const DEFAULT_MULTICOLOR_STYLE_ID = 'color-flat'
+
+// Legacy master-style ids from before the registry merge. Saved
+// placements and variants still carry them; the rehydration path maps
+// them to the renamed registry entries so historical state doesn't
+// silently break.
+export const LEGACY_MASTER_ID_MAP: Record<string, string> = {
+  pencil: 'pencil',
+  halftone: 'halftone-shade',
+  stippling: 'stippling-shade',
+  engraving: 'engraving',
+  contours: 'contours-topo',
+  outline: 'outline',
+  tsp: 'tsp',
+  spiral: 'spiral-master',
+  centerline: 'centerline-trace',
+  // Styles added after the registry split have no pre-merge alias, so
+  // they map to themselves — this keeps the "every mono master is
+  // reachable from a legacy id" invariant (printRegistry.test.ts) intact
+  // while still resolving cleanly on rehydration.
+  'ridge-pulsar': 'ridge-pulsar',
+  'dither-print': 'dither-print',
+  'etch-burin': 'etch-burin',
+  'string-thread': 'string-thread',
+  'hilbert-adaptive': 'hilbert-adaptive',
+  'quadtree-mosaic': 'quadtree-mosaic',
+  'phyllotaxis-bloom': 'phyllotaxis-bloom',
+  'voronoi-shatter': 'voronoi-shatter',
+  'text-shading': 'text-shading',
+  'attractor-smoke': 'attractor-smoke',
+  'superpixel-paint': 'superpixel-paint',
+  'noise-topo': 'noise-topo',
+  'coral-growth': 'coral-growth',
+  'flowfield-master': 'flowfield-master',
+  'voronoi-shade': 'voronoi-shade',
+  'hatch-fill': 'hatch-fill',
+  'squiggle-shade': 'squiggle-shade',
+  'hilbert-fill': 'hilbert-fill',
+  'gosper-fill': 'gosper-fill',
+  'concentric-rings': 'concentric-rings',
+  'tsp-optimized': 'tsp-optimized',
+  silhouette: 'silhouette',
+  lowpoly: 'lowpoly',
+  scribble: 'scribble',
+  'otsu-binary': 'otsu-binary',
+  // Phase-2 mono batch (2026-06) — identity entries so the coverage
+  // guarantee (every mono master reachable from a legacy id) holds.
+  'schotter-tumble': 'schotter-tumble',
+  'vein-growth': 'vein-growth',
+  'honeycomb-tone': 'honeycomb-tone',
+  'truchet-tiles': 'truchet-tiles',
+  'maze-walk': 'maze-walk',
+  'basket-weave': 'basket-weave',
+  'stitch-rows': 'stitch-rows',
+  'bubble-pack': 'bubble-pack',
+  'brick-courses': 'brick-courses',
+  'dash-shading': 'dash-shading',
+  'vinyl-rings': 'vinyl-rings',
+  'sunburst-rays': 'sunburst-rays',
+  'thread-fans': 'thread-fans',
+  'moire-beat': 'moire-beat',
+  'penrose-facets': 'penrose-facets',
+  'dragon-curve': 'dragon-curve',
+  'chladni-plate': 'chladni-plate',
+  'pendulum-trace': 'pendulum-trace',
+  // Variant batch (2026-06) — identity entries (same coverage guarantee).
+  'fern-growth': 'fern-growth',
+  'koch-island': 'koch-island',
+  'sierpinski-sweep': 'sierpinski-sweep',
+  'ring-halftone': 'ring-halftone',
+  'cross-stitch': 'cross-stitch',
+  'truchet-pipes': 'truchet-pipes',
+  'moire-lines': 'moire-lines',
+  'ridge-radial': 'ridge-radial',
+  'bayer-print': 'bayer-print',
+  'wind-field': 'wind-field',
+  'smoke-clifford': 'smoke-clifford',
+  'turing-stripes': 'turing-stripes',
+  'sound-wave': 'sound-wave',
+  'ascii-art': 'ascii-art',
+  lightning: 'lightning',
+  'op-art-warp': 'op-art-warp',
+  'fish-scales': 'fish-scales',
+}
+
+// ---- Query helpers ----
+
+export function getStyle(id: string | null | undefined): PrintStyle | undefined {
+  if (!id) return undefined
+  return PRINT_STYLES.find((s) => s.id === id)
+}
+
+export function masterStyles(): PrintStyle[] {
+  return PRINT_STYLES.filter((s) => s.scope === 'master')
+}
+
+// Filtered master styles by print mode. Styles with an undefined ``mode``
+// default to monochrome (historical contract — only mono masters existed
+// before the colour-master family landed). Callers pass the active
+// ``printMode`` so the picker shows the right gallery.
+export function masterStylesByMode(mode: PrintStyleMode): PrintStyle[] {
+  return PRINT_STYLES.filter((s) => s.scope === 'master' && (s.mode ?? 'monochrome') === mode)
+}
+
+export function layerStyles(kind?: PrintStyleKind): PrintStyle[] {
+  const layers = PRINT_STYLES.filter((s) => s.scope === 'layer')
+  if (!kind) return layers
+  return layers.filter((s) => s.applicableTo.includes(kind))
+}
+
+// Resolve a possibly-legacy master style id to a registry entry.
+// Returns the default master style if neither the id nor its legacy
+// mapping is found, so callers always get something usable.
+export function resolveMasterStyle(id: string | null | undefined): PrintStyle {
+  if (id) {
+    const direct = getStyle(id)
+    if (direct && direct.scope === 'master') return direct
+    const mapped = LEGACY_MASTER_ID_MAP[id]
+    if (mapped) {
+      const resolved = getStyle(mapped)
+      if (resolved && resolved.scope === 'master') return resolved
+    }
+  }
+  return getStyle(DEFAULT_MASTER_STYLE_ID)!
+}
+
+// Sister of ``resolveMasterStyle`` for the multicolour family.
+// Falls back to ``DEFAULT_MULTICOLOR_STYLE_ID`` (flat aplats) rather
+// than the monochrome default so callers in multicolour mode never end
+// up applying a luminance-bands segmentation by accident.
+export function resolveMulticolorStyle(id: string | null | undefined): PrintStyle {
+  if (id) {
+    const direct = getStyle(id)
+    if (direct && direct.scope === 'master' && direct.mode === 'multicolor') return direct
+  }
+  return getStyle(DEFAULT_MULTICOLOR_STYLE_ID)!
+}

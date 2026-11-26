@@ -84,7 +84,7 @@ class MvpApiTests(unittest.TestCase):
     def test_health_reports_local_pipeline(self):
         response = self.client.get("/api/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["vectorizer"], "vtracer")
+        self.assertEqual(response.json["vectorizer"], "inkscape-potrace")
         self.assertEqual(response.json["gcode"], "svg2gcode_grbl")
 
     def test_api_http_errors_are_json(self):
@@ -118,13 +118,49 @@ class MvpApiTests(unittest.TestCase):
         output = io.BytesIO()
         image.save(output, format="PNG")
 
-        contour_data = mvp_app._prepare_contour_image(output.getvalue())
+        contour_data = mvp_app._prepare_contour_image(output.getvalue(), mode="edge")
 
         with Image.open(io.BytesIO(contour_data)) as contours:
             self.assertEqual(contours.getpixel((32, 32)), 255)
             edge_width = sum(contours.getpixel((x, 32)) == 0 for x in range(7, 11))
             self.assertGreater(edge_width, 0)
             self.assertLessEqual(edge_width, 2)
+
+    def test_vectorize_emits_one_path_per_contour(self):
+        image = Image.new("RGB", (200, 200), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((20, 20, 70, 70), fill="black")
+        draw.rectangle((120, 120, 170, 170), fill="black")
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+
+        response = self.client.post(
+            "/api/vectorize",
+            data={"file": (io.BytesIO(output.getvalue()), "two-squares.png"), "mode": "brightness"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.json)
+        root = mvp_app.ET.fromstring(response.json["svg"].encode("utf-8"))
+        paths = [element for element in root.iter() if element.tag.rsplit("}", 1)[-1] == "path"]
+        self.assertEqual(len(paths), 2)
+        for path in paths:
+            self.assertEqual(path.get("d").count("M"), 1)
+
+        converted = self.client.post("/api/convert", json={"svg": response.json["svg"]})
+        self.assertEqual(converted.status_code, 200, converted.json)
+        pen_up_moves = [
+            line for line in converted.json["gcode"].splitlines() if line.startswith("G0 X")
+        ]
+        self.assertGreaterEqual(len(pen_up_moves), len(paths))
+
+    def test_vectorize_rejects_unknown_trace_mode(self):
+        response = self.client.post(
+            "/api/vectorize",
+            data={"file": (io.BytesIO(make_png()), "test.png"), "mode": "colour"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("РЕЖИМ", response.json["error"])
 
     def test_vectorize_rejects_images_without_detectable_contours(self):
         image = Image.new("RGB", (32, 32), "white")
@@ -212,32 +248,39 @@ class MvpApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_ai_generation_requires_external_data_consent(self):
-        with mock.patch.object(mvp_app, "Client") as client_class:
+        with mock.patch.object(mvp_app.image_generation, "generate_plotter_image") as generate:
             response = self.client.post("/api/generate-image", json={"prompt": "tree"})
         self.assertEqual(response.status_code, 400)
-        client_class.assert_not_called()
+        generate.assert_not_called()
 
-    def test_ai_generation_requires_and_uses_explicit_consent(self):
-        generated = mock.Mock()
-        generated.images.generate.return_value = {
-            "data": [{"url": "https://images.example.com/generated.png"}]
-        }
-        with (
-            mock.patch.object(mvp_app, "Client", return_value=generated),
-            mock.patch.object(mvp_app, "_download_generated_image", return_value=make_png()) as download,
-        ):
+    def test_ai_generation_returns_png_after_consent(self):
+        with mock.patch.object(
+            mvp_app.image_generation, "generate_plotter_image", return_value=make_png()
+        ) as generate:
             response = self.client.post(
                 "/api/generate-image",
                 json={"prompt": "tree", "allow_external": True},
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "image/png")
-        generated.images.generate.assert_called_once_with(
-            prompt=f"tree\n\n{mvp_app.PLOTTER_IMAGE_STYLE}",
-            model="flux",
-            response_format="url",
+        generate.assert_called_once_with("tree")
+
+    def test_ai_generation_reports_retry_after(self):
+        error = mvp_app.image_generation.ImageGenerationError(
+            "ЛИМИТ БЕСПЛАТНОЙ ГЕНЕРАЦИИ POLLINATIONS. ПОВТОРИТЕ ЧЕРЕЗ 45 СЕК.",
+            status=502,
+            retry_after=45,
         )
-        download.assert_called_once_with("https://images.example.com/generated.png")
+        with mock.patch.object(
+            mvp_app.image_generation, "generate_plotter_image", side_effect=error
+        ):
+            response = self.client.post(
+                "/api/generate-image",
+                json={"prompt": "tree", "allow_external": True},
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.headers["Retry-After"], "45")
+        self.assertIn("ПОВТОРИТЕ ЧЕРЕЗ 45 СЕК", response.json["error"])
 
     def test_fluidnc_rejects_public_hosts(self):
         response = self.client.post("/api/fluidnc/status", json={"host": "8.8.8.8"})
@@ -294,6 +337,37 @@ class MvpApiTests(unittest.TestCase):
         self.assertIn("M3 S800", received)
         self.assertIn("G4 P0.3", received)
         self.assertFalse(failures, failures)
+
+    def test_vectorize_accepts_custom_threshold_and_reports_metadata(self):
+        response = self.client.post(
+            "/api/vectorize",
+            data={"file": (io.BytesIO(make_png()), "test.png"), "mode": "brightness", "threshold": "0.45"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertIn("<svg", response.json["svg"])
+        self.assertEqual(response.json["trace_mode"], "brightness")
+        self.assertEqual(response.json["threshold"], 0.45)
+        self.assertGreater(response.json["path_count"], 0)
+
+    def test_vectorize_rejects_invalid_threshold(self):
+        response = self.client.post(
+            "/api/vectorize",
+            data={"file": (io.BytesIO(make_png()), "test.png"), "threshold": "2"},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_preflight_returns_workspace_metrics(self):
+        response = self.client.post(
+            "/api/preflight",
+            json={"svg": SVG, "bed_width_mm": 300, "bed_height_mm": 350, "speed_mm_s": 5},
+        )
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertGreater(response.json["drawing_length_mm"], 0)
+        self.assertGreater(response.json["line_count"], 0)
+        self.assertGreater(response.json["estimated_seconds"], 0)
+        self.assertFalse(response.json["outside_workspace"])
 
 
 if __name__ == "__main__":

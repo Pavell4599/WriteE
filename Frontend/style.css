@@ -53,6 +53,8 @@ button, select, input[type="range"] { cursor: pointer; }
 .file-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; padding: 12px 17px; font-size: 14px; }
 .file-row.hidden { display: none; }
 .remove-file { width: 34px; height: 34px; border: 0; border-radius: 50%; color: var(--muted); background: var(--soft); font-size: 20px; cursor: pointer; }
+.trace-options { margin-top: 18px; }
+.trace-options .settings-note { margin-bottom: 0; }
 .or-label { display: flex; align-items: center; gap: 15px; margin: 25px 0; color: #8b929c; font-size: 12px; font-weight: 700; }
 .or-label::before, .or-label::after { height: 1px; flex: 1; background: var(--line); content: ""; }
 .field-label { display: block; margin-bottom: 11px; }
@@ -97,6 +99,19 @@ textarea::placeholder { color: #9097a2; font-size: 14px; font-weight: 600; }
 .download-row { display: flex; justify-content: flex-end; margin-top: 10px; }
 .download-row .button { min-height: 42px; min-width: 0; font-size: 12px; }
 #gcode { min-height: 260px; font-family: Consolas, "Courier New", monospace; font-size: 14px; }
+
+.threshold-row { display:flex; align-items:center; justify-content:space-between; margin:16px 0 8px; color:var(--muted); font-size:12px; font-weight:800; }
+.threshold-row output { color:var(--accent); }
+#trace-threshold { height:20px; padding:0; border-radius:999px; background:transparent; accent-color:var(--accent); }
+.preflight { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:-4px 0 18px; padding:12px; border:1px solid var(--line); border-radius:18px; background:#fafbfd; }
+.preflight.loading { opacity:.72; }
+.preflight div { min-width:0; padding:8px; border-radius:12px; background:#fff; }
+.preflight div span { display:block; margin-bottom:5px; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.35px; }
+.preflight div strong { font-size:13px; }
+.preflight-status, .preflight-ready, .preflight-warning { grid-column:1/-1; margin:2px; font-size:11px; line-height:1.45; font-weight:800; }
+.preflight-ready { color:#3e8358; }
+.preflight-warning { color:#b54a4a; }
+.has-warning { border-color:#f1cccc; background:#fffafa; }
 
 @media (max-width: 620px) {
   .app { width: calc(100% - 32px); padding-top: 18px; }

@@ -1,0 +1,257 @@
+"""Layer extraction from the pivot SVG.
+
+Inspects the normalized SVG and produces one :class:`LayerInfo` per top-level
+group. Groups carrying an ``inkscape:label`` (as emitted by the converters)
+become individual layers; otherwise the whole document is treated as a single
+layer.
+
+Path length and bounding box are measured in the SVG's user-unit coordinate
+system (its ``viewBox``). For text/Markdown that system is millimeters by
+construction; for other inputs it is provisional until physical placement is
+decided in a later phase.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import threading
+from collections import OrderedDict
+from xml.etree import ElementTree as ET
+
+from svgelements import SVG, Shape
+
+from pen_plotter.core.pdf_postprocess import paint_value
+from pen_plotter.core.svg_ns import INKSCAPE_NS as _INKSCAPE_NS
+from pen_plotter.core.svg_ns import SVG_NS as _SVG_NS
+from pen_plotter.core.svg_ns import svg_tostring
+from pen_plotter.models import BoundingBox, LayerInfo
+
+_INKSCAPE_LABEL = f"{{{_INKSCAPE_NS}}}label"
+_DRAWABLE = {"path", "polyline", "polygon", "line", "circle", "rect", "ellipse"}
+
+
+def _local(tag: str) -> str:
+    """Return an element's local name without its namespace."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def strip_root_size(svg: str) -> str:
+    """Remove ``width``/``height`` from the root ``<svg>`` element.
+
+    This forces measurement and geometry libraries to work in the document's
+    ``viewBox`` user units instead of scaling to physical pixels. Unlike a
+    regex, it only ever touches the root element's attributes.
+
+    Args:
+        svg: The SVG markup.
+
+    Returns:
+        The SVG with root size attributes removed, or the input unchanged if it
+        cannot be parsed.
+    """
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError:
+        return svg
+    root.attrib.pop("width", None)
+    root.attrib.pop("height", None)
+    return svg_tostring(root)
+
+
+def _count_drawables(element: ET.Element) -> int:
+    """Count drawable descendants (and the element itself) of an element."""
+    count = 1 if _local(element.tag) in _DRAWABLE else 0
+    for child in element:
+        count += _count_drawables(child)
+    return count
+
+
+def _group_color(group: ET.Element) -> str:
+    """Resolve a representative color for a group from its fill or stroke.
+
+    Both the presentation attribute and the ``style`` declaration are
+    inspected, so an Inkscape-style ``style="fill:none;stroke:#ff0000"``
+    on the wrapping group (or any of its drawable children) is recognised
+    instead of falling back to black.
+    """
+    for attr in ("fill", "stroke"):
+        value = paint_value(group, attr)
+        if value and value != "none":
+            return value
+    for child in group.iter():
+        for attr in ("fill", "stroke"):
+            value = paint_value(child, attr)
+            if value and value != "none":
+                return value
+    return "#000000"
+
+
+# Memoisation for :func:`_measure`, keyed on a SHA-1 of the markup
+# rather than the markup itself: an ``lru_cache`` keyed on multi-MB SVG
+# strings would pin hundreds of MB of document text just to serve as
+# dictionary keys. The digest cache stores only the small
+# ``(length, bbox)`` results. Guarded by a lock so concurrent request
+# handlers can share it safely (the worst race is a duplicate
+# measurement, never a corrupt cache).
+_MEASURE_CACHE: OrderedDict[str, tuple[float, BoundingBox]] = OrderedDict()
+_MEASURE_CACHE_LOCK = threading.Lock()
+_MEASURE_CACHE_MAX = 1024
+
+
+def _measure(svg_markup: str) -> tuple[float, BoundingBox]:
+    """Measure total path length and bounding box in user units.
+
+    Physical ``width``/``height`` are stripped so svgelements reports lengths in
+    the document's ``viewBox`` coordinate system rather than scaling to pixels.
+    Results are memoized (keyed by content hash) since the same fragment may
+    be measured repeatedly.
+
+    Args:
+        svg_markup: A self-contained SVG document.
+
+    Returns:
+        A ``(length, bbox)`` pair; zeros if the SVG has no measurable geometry.
+    """
+    digest = hashlib.sha1(svg_markup.encode("utf-8")).hexdigest()
+    with _MEASURE_CACHE_LOCK:
+        cached = _MEASURE_CACHE.get(digest)
+        if cached is not None:
+            _MEASURE_CACHE.move_to_end(digest)
+            return cached
+    result = _measure_uncached(svg_markup)
+    with _MEASURE_CACHE_LOCK:
+        _MEASURE_CACHE[digest] = result
+        _MEASURE_CACHE.move_to_end(digest)
+        while len(_MEASURE_CACHE) > _MEASURE_CACHE_MAX:
+            _MEASURE_CACHE.popitem(last=False)
+    return result
+
+
+def _measure_uncached(svg_markup: str) -> tuple[float, BoundingBox]:
+    stripped = strip_root_size(svg_markup)
+    total = 0.0
+    x_min = y_min = float("inf")
+    x_max = y_max = float("-inf")
+    try:
+        parsed = SVG.parse(io.StringIO(stripped))
+    except Exception:
+        return 0.0, BoundingBox(x_min=0.0, y_min=0.0, x_max=0.0, y_max=0.0)
+
+    for element in parsed.elements():
+        if not isinstance(element, Shape):
+            continue
+        try:
+            total += float(element.length())
+            box = element.bbox()
+        except Exception:
+            continue
+        if box is None:
+            continue
+        x_min, y_min = min(x_min, box[0]), min(y_min, box[1])
+        x_max, y_max = max(x_max, box[2]), max(y_max, box[3])
+
+    if x_min == float("inf"):
+        return total, BoundingBox(x_min=0.0, y_min=0.0, x_max=0.0, y_max=0.0)
+    return total, BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+
+
+def _group_to_svg(viewbox: str | None, group: ET.Element) -> str:
+    """Wrap a single group as a standalone SVG for measurement."""
+    inner = svg_tostring(group)
+    attrs = f'xmlns="{_SVG_NS}" xmlns:inkscape="{_INKSCAPE_NS}"'
+    vb = f' viewBox="{viewbox}"' if viewbox else ""
+    return f"<svg {attrs}{vb}>{inner}</svg>"
+
+
+def _labeled_groups(root: ET.Element) -> list[ET.Element]:
+    """Return top-level ``<g>`` children carrying an ``inkscape:label``."""
+    return [
+        child
+        for child in root
+        if _local(child.tag) == "g" and child.get(_INKSCAPE_LABEL) is not None
+    ]
+
+
+def labeled_group_fragments(svg: str) -> list[tuple[str, str]]:
+    """Split a pivot SVG into ``(label, standalone-svg)`` fragments per layer.
+
+    Each labeled top-level group becomes its own standalone SVG (so it can be
+    measured or converted independently); when no labeled groups exist, the
+    whole document is returned as a single ``layer-1`` fragment. This is the
+    single source of truth for how the pipeline maps SVG groups to layers.
+
+    Args:
+        svg: The normalized SVG markup.
+
+    Returns:
+        Ordered ``(label, fragment)`` pairs in document order.
+
+    Raises:
+        ValueError: If the SVG cannot be parsed.
+    """
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError as exc:
+        raise ValueError(f"Could not parse SVG: {exc}") from exc
+
+    groups = _labeled_groups(root)
+    if not groups:
+        return [("layer-1", svg)]
+    viewbox = root.get("viewBox")
+    return [
+        (group.get(_INKSCAPE_LABEL) or f"layer-{i + 1}", _group_to_svg(viewbox, group))
+        for i, group in enumerate(groups)
+    ]
+
+
+def extract_layers(svg: str) -> list[LayerInfo]:
+    """Extract layer descriptors from a pivot SVG document.
+
+    Args:
+        svg: The normalized SVG markup.
+
+    Returns:
+        One :class:`LayerInfo` per detected layer, ordered by document order.
+
+    Raises:
+        ValueError: If the SVG cannot be parsed.
+    """
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError as exc:
+        raise ValueError(f"Could not parse SVG: {exc}") from exc
+
+    viewbox = root.get("viewBox")
+    groups = _labeled_groups(root)
+
+    if not groups:
+        length, bbox = _measure(svg)
+        return [
+            LayerInfo(
+                layer_id="layer-1",
+                source_color=_group_color(root),
+                target_pen_slot=None,
+                draw_order=0,
+                total_length_mm=length,
+                path_count=_count_drawables(root),
+                bbox=bbox,
+            )
+        ]
+
+    layers: list[LayerInfo] = []
+    for order, group in enumerate(groups):
+        label = group.get(_INKSCAPE_LABEL) or f"layer-{order + 1}"
+        length, bbox = _measure(_group_to_svg(viewbox, group))
+        layers.append(
+            LayerInfo(
+                layer_id=label,
+                source_color=_group_color(group),
+                target_pen_slot=None,
+                draw_order=order,
+                total_length_mm=length,
+                path_count=_count_drawables(group),
+                bbox=bbox,
+            )
+        )
+    return layers

@@ -1,0 +1,89 @@
+"""Stippling algorithm.
+
+Fills a binary color region with randomly scattered dots whose count scales
+with the region area.
+"""
+
+from __future__ import annotations
+
+from typing import Any, ClassVar
+from xml.sax.saxutils import quoteattr
+
+import numpy as np
+from numpy.typing import NDArray
+
+from pen_plotter.converters.algorithms._style import tone_darkness
+from pen_plotter.converters.algorithms.base import OptionSpec, RasterAlgorithm
+
+
+class StipplingAlgorithm(RasterAlgorithm):
+    """Renders a region as scattered point dots."""
+
+    name: ClassVar[str] = "stippling"
+    description: ClassVar[str] = "Fill regions with randomly scattered dots."
+    tone_aware: ClassVar[bool] = True
+    options_schema: ClassVar[list[OptionSpec]] = [
+        OptionSpec(
+            key="density", label="convert.density", type="number",
+            default=0.02, min=0.001, max=0.5, step=0.001,
+        ),
+        OptionSpec(
+            key="dot_radius_mm", label="convert.dotRadius", type="number",
+            default=0.22, min=0.04, max=1.9, step=0.1,
+        ),
+        OptionSpec(
+            key="seed", label="convert.seed", type="integer",
+            default=0, min=0, step=1,
+        ),
+    ]
+
+    def render_layer(
+        self,
+        mask: NDArray[Any],
+        color_hex: str,
+        label: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> str:
+        """Render the region as scattered dots.
+
+        Args:
+            mask: Boolean array (height, width); ``True`` marks region pixels.
+            color_hex: Hex color applied as the dot fill.
+            label: Layer label written to ``inkscape:label``.
+            options: Optional ``density`` (dots per region pixel, default 0.02),
+                ``dot_radius_px`` (default 0.6), and ``seed`` (default 0).
+
+        Returns:
+            A single SVG ``<g>...</g>`` group containing the dots.
+        """
+        opts = options or {}
+        density = float(opts.get("density", 0.02))
+        radius = float(opts.get("dot_radius_px", 0.6))
+        seed = int(opts.get("seed", 0))
+
+        bool_mask = mask.astype(bool)
+        ys, xs = np.nonzero(bool_mask)
+        group_open = f"<g inkscape:label={quoteattr(label)} fill={quoteattr(color_hex)}>"
+        if ys.size == 0 or density <= 0.0:
+            return group_open + "</g>"
+
+        count = max(1, int(ys.size * density))
+        rng = np.random.default_rng(seed)
+        # Tone redistributes the same dot budget toward darker pixels
+        # (the density knob still sets the total ink); without a usable
+        # tone map the sample stays uniform, exactly as before.
+        darkness = tone_darkness(bool_mask, opts)
+        if darkness is None:
+            idx = rng.choice(ys.size, size=min(count, ys.size), replace=False)
+        else:
+            weights = np.clip(darkness[ys, xs], 1e-3, None)
+            idx = rng.choice(
+                ys.size, size=min(count, ys.size), replace=False, p=weights / weights.sum()
+            )
+        dots = [
+            f'<circle cx="{float(xs[i]) + 0.5:.2f}" '
+            f'cy="{float(ys[i]) + 0.5:.2f}" r="{radius:.2f}"/>'
+            for i in idx
+        ]
+        return group_open + "".join(dots) + "</g>"

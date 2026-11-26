@@ -1,0 +1,167 @@
+// @vitest-environment happy-dom
+import { createPinia, setActivePinia } from 'pinia'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PlotterStatus } from '../api/client'
+
+const plotterConnect = vi.fn()
+const listSerialPorts = vi.fn()
+const plotterDisconnect = vi.fn()
+const plotterCommand = vi.fn()
+const plotterStatus = vi.fn()
+
+vi.mock('../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/client')>()
+  return {
+    ...actual,
+    websocketUrl: () => 'ws://test/ws/plotter',
+    plotterConnect: (...args: unknown[]) => plotterConnect(...args),
+    listSerialPorts: (...args: unknown[]) => listSerialPorts(...args),
+    plotterDisconnect: (...args: unknown[]) => plotterDisconnect(...args),
+    plotterCommand: (...args: unknown[]) => plotterCommand(...args),
+    plotterStatus: (...args: unknown[]) => plotterStatus(...args),
+  }
+})
+
+import { usePlotterStore } from './plotter'
+
+function makeStatus(over: Partial<PlotterStatus> = {}): PlotterStatus {
+  return {
+    connected: true,
+    total: 100,
+    sent: 0,
+    acked: 0,
+    state: 'running',
+    message: null,
+    ...over,
+  } as PlotterStatus
+}
+
+// Minimal WebSocket stand-in: records instances so the test can flip
+// readyState / push frames / observe close().
+class FakeWebSocket {
+  static CONNECTING = 0
+  static OPEN = 1
+  static CLOSING = 2
+  static CLOSED = 3
+  static instances: FakeWebSocket[] = []
+  url: string
+  readyState = FakeWebSocket.CONNECTING
+  onmessage: ((event: { data: string }) => void) | null = null
+  onclose: (() => void) | null = null
+  closed = false
+  constructor(url: string) {
+    this.url = url
+    FakeWebSocket.instances.push(this)
+  }
+  close(): void {
+    this.closed = true
+    this.readyState = FakeWebSocket.CLOSED
+  }
+}
+
+describe('plotter store', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    plotterConnect.mockReset()
+    plotterDisconnect.mockReset()
+    plotterCommand.mockReset()
+    plotterStatus.mockReset()
+    FakeWebSocket.instances = []
+    vi.stubGlobal('WebSocket', FakeWebSocket)
+  })
+
+  it('hydrate() re-learns a live connection and opens the status socket', async () => {
+    const store = usePlotterStore()
+    plotterStatus.mockResolvedValue(makeStatus({ connected: true, acked: 30 }))
+    await store.hydrate()
+    // After a reload the cockpit reflects the still-open connection + progress.
+    expect(store.status.connected).toBe(true)
+    expect(store.status.acked).toBe(30)
+    // …and the /ws/plotter stream is reopened so progress keeps flowing.
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('hydrate() stays disconnected (no socket) when the machine is not connected', async () => {
+    const store = usePlotterStore()
+    plotterStatus.mockResolvedValue(makeStatus({ connected: false, state: 'idle' }))
+    await store.hydrate()
+    expect(store.status.connected).toBe(false)
+    expect(FakeWebSocket.instances).toHaveLength(0)
+  })
+
+  it('REST responses update status when no live socket exists', async () => {
+    const store = usePlotterStore()
+    plotterCommand.mockResolvedValue(makeStatus({ acked: 10 }))
+    await store.pause()
+    expect(store.status.acked).toBe(10)
+  })
+
+  it('REST responses do not clobber WS-driven status while the socket is open', async () => {
+    const store = usePlotterStore()
+    plotterConnect.mockResolvedValue(makeStatus({ acked: 0 }))
+    await store.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.readyState = FakeWebSocket.OPEN
+
+    // Live frame: 50 lines acked.
+    ws.onmessage!({ data: JSON.stringify(makeStatus({ acked: 50 })) })
+    expect(store.status.acked).toBe(50)
+
+    // A slow REST snapshot from before the frame must NOT roll back.
+    plotterCommand.mockResolvedValue(makeStatus({ acked: 12 }))
+    await store.pause()
+    expect(store.status.acked).toBe(50)
+  })
+
+  it('disconnect() closes the websocket and applies the REST status', async () => {
+    const store = usePlotterStore()
+    plotterConnect.mockResolvedValue(makeStatus())
+    await store.connect()
+    const ws = FakeWebSocket.instances[0]!
+    ws.readyState = FakeWebSocket.OPEN
+
+    plotterDisconnect.mockResolvedValue(makeStatus({ connected: false, state: 'idle' }))
+    await store.disconnect()
+
+    expect(ws.closed).toBe(true)
+    // Socket was closed first, so the REST snapshot lands.
+    expect(store.status.connected).toBe(false)
+    // No reconnect: a new socket must not have been opened.
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+})
+
+describe('usePlotterStore — detectAndConnect (UX v2)', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    plotterConnect.mockReset()
+    listSerialPorts.mockReset()
+  })
+
+  it('tries candidates in order and adopts the first that connects', async () => {
+    listSerialPorts.mockResolvedValue([
+      { device: '/dev/ttyUSB0', description: 'CH340', likely: true },
+      { device: '/dev/ttyS0', description: 'UART', likely: false },
+    ])
+    plotterConnect
+      .mockRejectedValueOnce(new Error('busy'))
+      .mockResolvedValueOnce(makeStatus({ connected: true, state: 'idle' }))
+    const store = usePlotterStore()
+    await store.detectAndConnect()
+    expect(plotterConnect).toHaveBeenCalledTimes(2)
+    expect(plotterConnect.mock.calls[0]?.[0]).toBe('/dev/ttyUSB0')
+    expect(plotterConnect.mock.calls[1]?.[0]).toBe('/dev/ttyS0')
+    // The manual port field now shows what actually worked.
+    expect(store.port).toBe('/dev/ttyS0')
+    expect(store.status.connected).toBe(true)
+  })
+
+  it('reports failure without connecting when no candidate answers', async () => {
+    listSerialPorts.mockResolvedValue([{ device: '/dev/ttyUSB0', description: '', likely: true }])
+    plotterConnect.mockRejectedValue(new Error('no device'))
+    const store = usePlotterStore()
+    await store.detectAndConnect()
+    expect(store.status.connected).toBe(false)
+    expect(store.detecting).toBe(false)
+  })
+})

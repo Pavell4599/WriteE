@@ -1,0 +1,58 @@
+{
+  "name": "omniplot-frontend",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "lint": "eslint \"src/**/*.{ts,vue}\"",
+    "lint:fix": "eslint \"src/**/*.{ts,vue}\" --fix",
+    "format": "prettier --write \"src/**/*.{ts,vue,json,css}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,vue,json,css}\"",
+    "gen:openapi": "cd ../backend && uv run python scripts/generate_openapi.py > openapi.json",
+    "gen:types": "openapi-typescript ../backend/openapi.json -o src/domain/api-types.ts",
+    "gen:manifests": "node scripts/gen-manifest-snapshot.mjs",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install --with-deps chromium"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dompurify": "^3.4.12",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.12",
+    "vue-i18n": "^11.1.0",
+    "vuedraggable": "^4.1.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@playwright/test": "1.60.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "@vue/test-utils": "^2.4.10",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "eslint-plugin-vue": "^10.0.0",
+    "globals": "^16.0.0",
+    "happy-dom": "^20.10.6",
+    "jsdom": "^29.1.1",
+    "openapi-typescript": "^7.13.0",
+    "postcss": "^8.4.47",
+    "prettier": "^3.3.3",
+    "tailwindcss": "^3.4.14",
+    "typescript": "^5.6.3",
+    "vite": "^7.3.5",
+    "vitest": "^4.1.7",
+    "vue-eslint-parser": "^10.0.0",
+    "vue-tsc": "^2.1.10"
+  },
+  "overrides": {
+    "glob": "^13.0.0",
+    "rimraf": "^6.0.0"
+  }
+}

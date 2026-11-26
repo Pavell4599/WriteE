@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local data (SQLite job history)
+backend/data/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+*.local
+# Repo-scoped npm cache used by install.sh to bypass a poisoned ~/.npm
+.npm-cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+backend/.coverage
+backend/coverage.xml
+
+# Playwright local artifacts
+frontend/test-results/
+frontend/playwright-report/

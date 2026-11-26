@@ -1,0 +1,131 @@
+"""Low-poly (Delaunay triangulation) algorithm.
+
+Scatters sample points over the region, builds a Delaunay triangulation
+of them, keeps the triangles whose centroid falls inside the mask, and
+emits each triangle *edge* as a pen stroke. Shared edges are de-duplicated
+so the plotter draws every facet boundary exactly once.
+
+The result is the faceted "low-poly" wireframe look. Tone is driven by
+point ``density``: more points → smaller facets → denser lines → darker,
+so monochrome bands can lerp the density from dark to light.
+
+Uses ``scipy.spatial.Delaunay``; when scipy is unavailable the algorithm
+degrades gracefully to an empty group rather than crashing (the same
+contract the other scipy-backed algorithms follow).
+"""
+
+from __future__ import annotations
+
+from typing import Any, ClassVar
+from xml.sax.saxutils import quoteattr
+
+import numpy as np
+from numpy.typing import NDArray
+
+from pen_plotter.converters.algorithms._style import stroke_attr_px, tone_darkness
+from pen_plotter.converters.algorithms.base import OptionSpec, RasterAlgorithm
+
+
+class LowPolyAlgorithm(RasterAlgorithm):
+    """Renders a region as a Delaunay triangulation wireframe."""
+
+    name: ClassVar[str] = "lowpoly"
+    description: ClassVar[str] = (
+        "Low-poly facets — a Delaunay triangulation of scattered points, "
+        "drawn as edges. Denser points read darker."
+    )
+    tone_aware: ClassVar[bool] = True
+
+    options_schema: ClassVar[list[OptionSpec]] = [
+        OptionSpec(key="density", label="convert.density", type="number",
+                   default=0.01, min=0.001, max=0.1, step=0.001),
+        OptionSpec(key="seed", label="convert.seed", type="integer",
+                   default=0, min=0, step=1),
+    ]
+
+    def render_layer(
+        self,
+        mask: NDArray[Any],
+        color_hex: str,
+        label: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> str:
+        """Render the region as triangle-edge strokes.
+
+        Args:
+            mask: Boolean array (height, width); ``True`` marks region pixels.
+            color_hex: Hex stroke colour applied to every edge.
+            label: Layer label written to ``inkscape:label``.
+            options: Optional ``density`` (sample points per region pixel,
+                default 0.01 — higher packs smaller facets), ``seed`` (RNG
+                seed, default 0), and ``stroke_width`` (default 0.8).
+
+        Returns:
+            A single SVG ``<g>...</g>`` group of ``<line>`` triangle edges.
+        """
+        opts = options or {}
+        density = max(0.0, float(opts.get("density", 0.01)))
+        seed = int(opts.get("seed", 0))
+        stroke_width = stroke_attr_px(opts)
+
+        bool_mask = mask.astype(bool)
+        ys, xs = np.nonzero(bool_mask)
+        group_open = (
+            f"<g inkscape:label={quoteattr(label)} stroke={quoteattr(color_hex)} "
+            f'fill="none" stroke-width="{stroke_width:.2f}" '
+            f'stroke-linecap="round" stroke-linejoin="round">'
+        )
+        # Need at least a triangle's worth of points to tessellate.
+        if ys.size < 3 or density <= 0.0:
+            return group_open + "</g>"
+
+        try:
+            from scipy.spatial import Delaunay
+        except ImportError:
+            return group_open + "</g>"
+
+        count = max(3, int(ys.size * density))
+        rng = np.random.default_rng(seed)
+        # Tone pulls sample points toward darker pixels — smaller facets
+        # (denser edges) where the image is dark, coarse facets in the
+        # highlights — without changing the total point budget.
+        darkness = tone_darkness(bool_mask, opts)
+        if darkness is None:
+            idx = rng.choice(ys.size, size=min(count, ys.size), replace=False)
+        else:
+            weights = np.clip(darkness[ys, xs], 1e-3, None)
+            idx = rng.choice(
+                ys.size, size=min(count, ys.size), replace=False, p=weights / weights.sum()
+            )
+        pts = np.column_stack([xs[idx], ys[idx]]).astype(np.float64)
+        # Collinear or duplicate-heavy samples make Delaunay throw; bail to
+        # an empty group rather than propagate a QhullError.
+        if np.unique(pts, axis=0).shape[0] < 3:
+            return group_open + "</g>"
+        try:
+            tri = Delaunay(pts)
+        except Exception:  # pragma: no cover — QhullError on degenerate input
+            return group_open + "</g>"
+
+        height, width = bool_mask.shape
+        # De-duplicate shared edges (each interior edge is shared by two
+        # triangles) so the pen traces every facet boundary just once.
+        edges: set[tuple[int, int]] = set()
+        for simplex in tri.simplices:
+            a, b, c = pts[simplex]
+            cx = (a[0] + b[0] + c[0]) / 3.0
+            cy = (a[1] + b[1] + c[1]) / 3.0
+            ix, iy = int(round(cx)), int(round(cy))
+            if 0 <= ix < width and 0 <= iy < height and bool_mask[iy, ix]:
+                i0, i1, i2 = int(simplex[0]), int(simplex[1]), int(simplex[2])
+                edges.add((min(i0, i1), max(i0, i1)))
+                edges.add((min(i1, i2), max(i1, i2)))
+                edges.add((min(i2, i0), max(i2, i0)))
+
+        lines = []
+        for u, v in edges:
+            x1, y1 = pts[u]
+            x2, y2 = pts[v]
+            lines.append(f'<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}"/>')
+        return group_open + "".join(lines) + "</g>"

@@ -1,0 +1,184 @@
+"""Print-plan entities: the single pivot exchanged between front, services and engines.
+
+``PrintPlan`` is what the client sends when it wants something rendered or
+checked. ``ResolvedPlan`` is what the application services emit after
+applying profile defaults, validating invariants and computing a stable
+hash — this is the snapshot the engines actually consume and the one we
+archive for traceability.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+PausePolicy = Literal["auto", "always", "never"]
+ScaleMode = Literal["fit", "actual"]
+TypographyAlignment = Literal["left", "center", "right", "justify"]
+
+
+class TypographyPlan(BaseModel):
+    """Typography settings for text sources, carried through the pivot.
+
+    Mirrors :class:`pen_plotter.typography.TypographyOptions` but lives
+    in the domain layer (no Pillow / hershey-fonts dependency). The
+    fields are forwarded into the resolved snapshot and the
+    ``plan_hash`` so two plans differing only in font / size / weight
+    can no longer collide.
+
+    Today this rides as traceability data: the actual text→SVG render
+    still happens at ``/upload`` time (or via ``_reprocess_existing``
+    when the operator changes a setting and the frontend re-uploads).
+    A later lot can let the application services re-render text
+    directly from this plan; the data is ready for that day.
+    """
+
+    font: str = "futural"
+    font_size_mm: float = Field(default=10.0, gt=0.0, le=200.0)
+    page_width_mm: float = Field(default=210.0, gt=0.0)
+    page_height_mm: float = Field(default=297.0, gt=0.0)
+    margin_mm: float = Field(default=15.0, ge=0.0)
+    line_spacing: float = Field(default=1.5, gt=0.0)
+    alignment: TypographyAlignment = "left"
+    stroke_width_mm: float = Field(default=0.3, gt=0.0)
+    bold: bool = False
+    italic: bool = False
+    letter_spacing_mm: float = Field(default=0.0, ge=-10.0, le=50.0)
+
+
+class PlacementPlan(BaseModel):
+    """Sheet placement inside the machine workspace.
+
+    Mirrors :class:`pen_plotter.models.Placement` — kept as a separate
+    domain model so the pivot is self-contained and doesn't pull legacy
+    types into the new package boundary.
+    """
+
+    sheet_width_mm: float = Field(gt=0.0)
+    sheet_height_mm: float = Field(gt=0.0)
+    offset_x_mm: float = 0.0
+    offset_y_mm: float = 0.0
+
+
+class LayerPlan(BaseModel):
+    """Per-layer print settings — the unified pivot type.
+
+    Replaces the old ``GenerateLayer`` Pydantic model and
+    ``LayerGeneration`` dataclass. Every field is optional except
+    ``layer_id``; defaults are filled in later by
+    :func:`pen_plotter.application.plan_resolver.resolve_plan` using
+    the active machine profile.
+
+    Note on ``optimize`` / ``simplify_tolerance_mm``: today the SVG
+    inside the surrounding :class:`PrintPlan` is already optimized by
+    the frontend's ``optimize → preflight → generate`` pipeline, so
+    these fields are traceability data — they ride along into the
+    resolved plan and the persisted snapshot, and they participate in
+    ``plan_hash`` so equal SVG + different optimize intent cannot
+    collide. A later refactor (lot L3+) will let the application
+    services drive optimization directly from these fields.
+    """
+
+    layer_id: str
+    target_pen_slot: int | None = None
+    drawing_speed_mm_s: float | None = None
+    source_color: str | None = None
+    color_label: str | None = None
+    pause_before: PausePolicy = "auto"
+    optimize: bool = True
+    simplify_tolerance_mm: float | None = None
+    # Operator-picked colour from the active pool (L5/L6). When set,
+    # the G-code prompt names this hex instead of the raw centroid;
+    # when the hex also matches an installed pen the tool-change path
+    # uses the pen slot rather than the mono-pen swap prompt.
+    assigned_color_hex: str | None = None
+
+
+class PlanMetadata(BaseModel):
+    """Provenance information attached to a plan.
+
+    The client may set ``client_version`` so a stored snapshot can later
+    be correlated with the UI release that produced it.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    client_version: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class PrintPlan(BaseModel):
+    """What the operator wants drawn, before profile defaults apply.
+
+    The same instance flows through ``/preflight`` and ``/generate`` so
+    both endpoints provably operate on identical inputs.
+    """
+
+    svg: str
+    profile_name: str
+    layers: list[LayerPlan] = Field(default_factory=list)
+    scale_mode: ScaleMode = "fit"
+    margin_mm: float = 10.0
+    placement: PlacementPlan | None = None
+    # Typography settings for text-source plans. ``None`` means "not a
+    # text source" or "rely on the SVG that already shipped with this
+    # plan".
+    typography: TypographyPlan | None = None
+    # Reference to the original uploaded file in the library, used by
+    # the application services to re-render text from the source bytes
+    # at /preflight + /generate time when the operator changes the
+    # typography (font, size, hershey toggle, etc.) without re-uploading.
+    # ``None`` means "render-from-bytes is not available; use ``svg``
+    # as-is" (the legacy path, still supported for vector / bitmap
+    # placements + for older clients).
+    library_file_id: str | None = None
+    # MIME of the original library file. Required for ``library_file_id``
+    # to be useful — the application services route the bytes back
+    # through ``converters.registry.for_mime(...)`` and need the
+    # original content type to find the right text converter. Kept as a
+    # separate field rather than re-fetched from the FileRecord so the
+    # plan stays self-contained for tests + tracing.
+    source_mime: str | None = None
+    metadata: PlanMetadata = Field(default_factory=PlanMetadata)
+
+
+_DEFAULT_SIMPLIFY_TOLERANCE_MM = 0.05
+
+
+class ResolvedLayer(BaseModel):
+    """A layer with every setting resolved against the active profile.
+
+    No ``None`` survives here: ``drawing_speed_mm_s`` falls back to the
+    profile speed, ``simplify_tolerance_mm`` falls back to the engine
+    default (0.05), and ``pause_before`` keeps the operator's choice
+    (``"auto"`` / ``"always"`` / ``"never"``) for the engine to act on.
+    """
+
+    layer_id: str
+    target_pen_slot: int | None
+    drawing_speed_mm_s: float
+    source_color: str | None
+    color_label: str | None
+    pause_before: PausePolicy
+    pen_slot_installed: bool
+    optimize: bool
+    simplify_tolerance_mm: float
+
+
+class ResolvedPlan(BaseModel):
+    """The plan after defaults + validation, ready to feed the engines.
+
+    Carries the original ``PrintPlan`` plus the per-layer resolution and
+    a deterministic content hash. Engines never re-read the raw plan;
+    they read the resolved one. Snapshots stored in SQLite are exactly
+    instances of this model.
+    """
+
+    plan: PrintPlan
+    layers: list[ResolvedLayer]
+    plan_hash: str
+    profile_name: str
+    profile_drawing_speed_mm_s: float
+    mono_pen: bool

@@ -1,0 +1,634 @@
+"""Job history persistence via SQLModel/SQLite.
+
+Stores a lightweight record per processed upload so the UI can show a history.
+The engine is module-level for the app, but every function accepts an explicit
+engine so tests can use an isolated in-memory database.
+"""
+
+from __future__ import annotations
+
+import enum
+import logging
+import os
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+
+from sqlalchemy import Engine, inspect, text
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.schema import Column
+from sqlmodel import Field, Session, SQLModel, create_engine, desc, select
+
+from pen_plotter.domain.print_plan import ResolvedPlan
+from pen_plotter.models import Job
+
+_log = logging.getLogger(__name__)
+
+_DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "omniplot.db"
+_DB_PATH = Path(os.environ.get("OMNIPLOT_DB", _DEFAULT_DB))
+
+# Bumped whenever a persisted row's JSON-serialized shape changes in a
+# way that requires a migration. Stored on every new row so a future
+# upgrade can detect old shapes and adapt instead of crashing in the
+# deserializer. Read the contract here:
+# docs/contract_architecture.md#persistence-schema-version
+PERSISTENCE_SCHEMA_VERSION = 1
+
+
+class JobRecord(SQLModel, table=True):
+    """A persisted summary of one processed job."""
+
+    job_id: str = Field(primary_key=True)
+    source_file: str
+    source_mime: str
+    profile_name: str
+    status: str
+    layer_count: int
+    created_at: datetime
+    # Schema version stamped at write time. Older rows back-filled to 0
+    # by ``_add_missing_columns`` so a future migration can detect
+    # ``schema_version < N`` and reshape on read.
+    schema_version: int = Field(default=0)
+
+
+class PlanSnapshotRecord(SQLModel, table=True):
+    """A resolved :class:`PrintPlan` archived for diagnostics.
+
+    Keyed by the deterministic ``plan_hash`` produced by
+    :func:`pen_plotter.application.plan_resolver.resolve_plan`, so the
+    same logical plan only ever occupies one row regardless of how many
+    times it's submitted. ``plan_json`` carries the full resolved plan
+    so an operator can replay or compare it later.
+    """
+
+    plan_hash: str = Field(primary_key=True)
+    profile_name: str = Field(index=True)
+    layer_count: int
+    created_at: datetime
+    plan_json: str
+    schema_version: int = Field(default=0)
+
+
+class FileRecord(SQLModel, table=True):
+    """A persisted, dedup-by-hash entry in the file library.
+
+    One row per unique uploaded source (keyed by ``sha256``). The actual
+    bytes and the normalized SVG live on disk under ``data/files/<file_id>/``;
+    this table only carries the metadata needed by the file-list UI.
+    """
+
+    file_id: str = Field(primary_key=True)
+    sha256: str = Field(index=True, unique=True)
+    source_file: str
+    source_mime: str
+    size_bytes: int
+    layer_count: int
+    folder: str = Field(default="", index=True)
+    created_at: datetime
+    schema_version: int = Field(default=0)
+
+
+class AppSettingRecord(SQLModel, table=True):
+    """Generic key/value store for small global app settings.
+
+    Used today for the ``palette_source`` toggle that picks where the
+    per-layer colour picker reads from (installed pens / available
+    colours / union). The shape stays generic so future single-value
+    settings can land without another migration: each setting is one
+    row, ``key`` is the namespaced identifier, ``value`` carries the
+    string-encoded payload (JSON for non-string types).
+    """
+
+    key: str = Field(primary_key=True)
+    value: str
+
+
+class AvailableColorRecord(SQLModel, table=True):
+    """An ink the operator has on hand but doesn't necessarily mount.
+
+    The library is a global app-wide inventory of pen colours — independent
+    of any specific machine profile. It feeds the editor's per-layer
+    colour picker so the operator can pre-declare every Sharpie / fineliner
+    they own once, then assign them to layers without typing ``#`` codes
+    each time. ``hex`` is the only mandatory field; ``name`` is optional
+    (UI falls back to the hex code) and ``position`` drives the display
+    order so the operator can rearrange the swatch strip.
+    """
+
+    color_id: str = Field(primary_key=True)
+    # Lowercased ``#rrggbb``. Indexed unique so duplicates can't sneak in
+    # through the API even if the client doesn't dedupe; the endpoint
+    # surfaces the existing entry instead of returning a 409.
+    hex: str = Field(index=True, unique=True)
+    # Free-form operator label ("Cyan Sharpie 04", "Rouge cerise"); empty
+    # string when unset. The picker shows the hex when this is blank.
+    name: str = Field(default="")
+    # Display ordering. Auto-assigned to ``max(position) + 1`` at create
+    # time so new entries land at the end of the strip; can be rewritten
+    # by the PATCH endpoint to reorder.
+    position: int = Field(default=0, index=True)
+    # Pen tip / line width in millimetres. Each marker lays down a
+    # different stroke, which drives line spacing for fills and the
+    # preview's rendered thickness. Defaults to a typical fineliner so
+    # rows migrated from an older DB (where the column is back-filled by
+    # ``_add_missing_columns``) get a sensible value rather than 0.
+    stroke_width_mm: float = Field(default=0.5)
+    # Accumulated distance actually drawn with this pen, in millimetres.
+    # Incremented by the frontend each time a job is sent/queued; reset
+    # manually when the operator swaps the pen. Lets the operator track
+    # wear and know when to replace a marker.
+    odometer_mm: float = Field(default=0.0)
+    created_at: datetime
+
+
+engine: Engine = create_engine(f"sqlite:///{_DB_PATH}")
+
+
+_MISSING = object()
+
+
+def _scalar_default(column: Column[Any]) -> object:
+    """Return a column's constant Python default, or ``_MISSING``.
+
+    SQLModel's ``Field(default=…)`` becomes a scalar SQLAlchemy column
+    default; ``default_factory`` (JSON containers) and callables (timestamps)
+    are per-row and can't be inlined, so they're skipped. Enum members are
+    unwrapped to their stored value (``RunState.QUEUED`` → ``"queued"``).
+    """
+    default = column.default
+    if default is None or not getattr(default, "is_scalar", False):
+        return _MISSING
+    value = getattr(default, "arg", _MISSING)
+    if isinstance(value, enum.Enum):
+        return value.value
+    return value
+
+
+def _add_missing_columns(target: Engine) -> None:
+    """Add columns that exist on the models but not yet in the database.
+
+    A lightweight, additive-only migration so new columns (e.g. queue fields
+    added in later versions) don't break an existing SQLite database. Each
+    added column is **back-filled** to its declared default so pre-migration
+    rows read back the intended value instead of ``NULL`` — e.g. an
+    ``AvailableColorRecord`` from before ``stroke_width_mm`` existed becomes
+    ``0.5`` rather than ``NULL`` (which would violate the model's ``float``
+    type on read). Renames, drops and type changes are out of scope and still
+    require a manual migration.
+    """
+    inspector = inspect(target)
+    for table_name, table in SQLModel.metadata.tables.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table_name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            default_value = _scalar_default(column)
+            if not column.nullable and default_value is _MISSING:
+                _log.warning(
+                    "Cannot auto-add non-nullable column %s.%s without a default; "
+                    "a manual migration is required.",
+                    table_name,
+                    column.name,
+                )
+                continue
+            col_type = column.type.compile(dialect=target.dialect)
+            with target.begin() as conn:
+                conn.execute(
+                    text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column.name}" {col_type}')
+                )
+                # Back-fill existing rows to the declared default. Without this
+                # the new column is NULL on every pre-migration row, silently
+                # corrupting non-nullable numeric/string fields on read.
+                if default_value is not _MISSING:
+                    conn.execute(
+                        text(
+                            f'UPDATE "{table_name}" SET "{column.name}" = :value '
+                            f'WHERE "{column.name}" IS NULL'
+                        ),
+                        {"value": default_value},
+                    )
+            _log.info("Added missing column %s.%s", table_name, column.name)
+
+
+def _add_missing_indexes(target: Engine) -> None:
+    """Create model-declared indexes absent from an existing table.
+
+    ``create_all`` builds indexes when it creates a table, but a table that
+    predates a newly-indexed (or newly-``unique``) column keeps the old,
+    index-less shape. This creates the missing ones so, e.g. a ``PrintRun``
+    table from before ``idempotency_key`` was ``unique`` gains the unique
+    index that makes concurrent-enqueue dedup atomic. A unique index that
+    can't be built because the existing data already holds duplicates is
+    logged and skipped rather than crashing startup.
+    """
+    inspector = inspect(target)
+    existing_tables = set(inspector.get_table_names())
+    for table_name, table in SQLModel.metadata.tables.items():
+        if table_name not in existing_tables:
+            continue
+        present = {idx["name"]: idx for idx in inspector.get_indexes(table_name)}
+        for index in table.indexes:
+            existing = present.get(index.name)
+            # Already there with the right uniqueness — nothing to do. An
+            # index present with the WRONG uniqueness (e.g. a non-unique
+            # ``idempotency_key`` index from an intermediate version) must be
+            # replaced, or dedup would silently stay non-atomic (P1.5).
+            if existing is not None and bool(existing.get("unique")) == bool(index.unique):
+                continue
+            try:
+                if index.unique and not _prepare_unique_index(target, table, index):
+                    _log.error(
+                        "Cannot create unique index %s on %s: unrepairable duplicate data. "
+                        "Dedup for this column is NOT atomic until it is resolved.",
+                        index.name,
+                        table_name,
+                    )
+                    continue
+                if existing is not None:
+                    with target.begin() as conn:
+                        conn.execute(text(f'DROP INDEX IF EXISTS "{index.name}"'))
+                index.create(bind=target, checkfirst=True)
+                _log.info(
+                    "Created %sindex %s on %s",
+                    "unique " if index.unique else "",
+                    index.name,
+                    table_name,
+                )
+            except (OperationalError, IntegrityError) as exc:
+                _log.warning(
+                    "Could not create index %s on %s (existing data may violate it): %s",
+                    index.name,
+                    table_name,
+                    exc,
+                )
+
+
+def _has_duplicate_values(target: Engine, table_name: str, columns: list[str]) -> bool:
+    """True if any non-NULL value (combination) repeats in ``columns``."""
+    col_list = ", ".join(f'"{c}"' for c in columns)
+    not_null = " AND ".join(f'"{c}" IS NOT NULL' for c in columns)
+    with target.connect() as conn:
+        row = conn.execute(
+            text(
+                f'SELECT 1 FROM "{table_name}" WHERE {not_null} '
+                f"GROUP BY {col_list} HAVING COUNT(*) > 1 LIMIT 1"
+            )
+        ).first()
+    return row is not None
+
+
+def _prepare_unique_index(target: Engine, table: Any, index: Any) -> bool:
+    """Make the data safe for a unique ``index``; return ``True`` if it can be built.
+
+    For a single **nullable** column (the ``idempotency_key`` case) duplicate
+    values are repaired in place on SQLite: the earliest row keeps the value and
+    the rest are set to NULL, so the client-supplied key still dedups the run it
+    first created while the unique index — and therefore atomic ``enqueue`` — can
+    be established. Anything else (non-nullable, multi-column, non-SQLite) is not
+    auto-repaired; the caller is told whether duplicates remain.
+    """
+    columns = list(index.columns)
+    names = [c.name for c in columns]
+    if len(columns) == 1 and columns[0].nullable and target.dialect.name == "sqlite":
+        col = names[0]
+        with target.begin() as conn:
+            result = conn.execute(
+                text(
+                    f'UPDATE "{table.name}" SET "{col}" = NULL '
+                    f'WHERE "{col}" IS NOT NULL AND rowid NOT IN ('
+                    f'  SELECT MIN(rowid) FROM "{table.name}" '
+                    f'  WHERE "{col}" IS NOT NULL GROUP BY "{col}")'
+                )
+            )
+            if result.rowcount:
+                _log.warning(
+                    "Repaired %d duplicate %s.%s value(s) to build unique index %s",
+                    result.rowcount,
+                    table.name,
+                    col,
+                    index.name,
+                )
+        return True
+    # Can't auto-repair — report whether the index is buildable as-is.
+    return not _has_duplicate_values(target, table.name, names)
+
+
+def _install_audit_immutability_triggers(target: Engine) -> None:
+    """Install SQLite triggers that make the ``auditentry`` table append-only.
+
+    The application code never updates or deletes audit rows, but a
+    rogue debug session, a misconfigured admin tool or a future ORM
+    misuse could. Triggers at the DB level make the immutability a
+    hard guarantee instead of a code-review convention.
+
+    SQLite-only by design: the production deployment ships a SQLite
+    file (``omniplot.db``). If the engine is ever pointed at another
+    backend the triggers are skipped — those dialects need their own
+    equivalent (e.g. PostgreSQL ``RAISE EXCEPTION`` in a BEFORE trigger
+    function).
+    """
+    if target.dialect.name != "sqlite":
+        return
+    inspector = inspect(target)
+    if not inspector.has_table("auditentry"):
+        return
+    with target.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS auditentry_no_update "
+                "BEFORE UPDATE ON auditentry BEGIN "
+                "SELECT RAISE(ABORT, 'audit log is append-only'); END"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS auditentry_no_delete "
+                "BEFORE DELETE ON auditentry BEGIN "
+                "SELECT RAISE(ABORT, 'audit log is append-only'); END"
+            )
+        )
+
+
+def init_db(target: Engine = engine) -> None:
+    """Create the database directory and tables, then apply additive migrations.
+
+    Args:
+        target: The engine to initialize.
+    """
+    if target.url.database and target.url.database != ":memory:":
+        Path(target.url.database).parent.mkdir(parents=True, exist_ok=True)
+    # Ensure the IR cache table is registered on SQLModel.metadata
+    # before create_all runs. Importing here (rather than at module
+    # top) avoids a circular import with ``application.ir_cache``,
+    # which itself imports the engine from this module.
+    import pen_plotter.application.ir_cache  # noqa: F401
+
+    SQLModel.metadata.create_all(target)
+    _add_missing_columns(target)
+    _add_missing_indexes(target)
+    _install_audit_immutability_triggers(target)
+
+
+def save_job(job: Job, target: Engine = engine) -> JobRecord:
+    """Persist a job summary.
+
+    Args:
+        job: The job to record.
+        target: The engine to write to.
+
+    Returns:
+        The stored :class:`JobRecord`.
+    """
+    record = JobRecord(
+        job_id=job.job_id,
+        source_file=job.source_file,
+        source_mime=job.source_mime,
+        profile_name=job.profile_name,
+        status=job.status,
+        layer_count=len(job.layers),
+        created_at=job.created_at,
+        schema_version=PERSISTENCE_SCHEMA_VERSION,
+    )
+    with Session(target) as session:
+        session.merge(record)
+        session.commit()
+    return record
+
+
+def list_jobs(target: Engine = engine, limit: int = 50) -> list[JobRecord]:
+    """Return recent job records, newest first.
+
+    Args:
+        target: The engine to read from.
+        limit: Maximum number of records to return.
+
+    Returns:
+        Job records ordered by creation time, descending.
+    """
+    with Session(target) as session:
+        statement = select(JobRecord).order_by(desc(JobRecord.created_at)).limit(limit)
+        return list(session.exec(statement).all())
+
+
+def save_file_record(record: FileRecord, target: Engine = engine) -> FileRecord:
+    """Insert or update a :class:`FileRecord` (upsert by ``file_id``)."""
+    with Session(target) as session:
+        session.merge(record)
+        session.commit()
+    return record
+
+
+def get_file_record(file_id: str, target: Engine = engine) -> FileRecord | None:
+    """Return a file record by id, or ``None``."""
+    with Session(target) as session:
+        return session.get(FileRecord, file_id)
+
+
+def get_file_record_by_hash(sha256: str, target: Engine = engine) -> FileRecord | None:
+    """Return the file record whose content hash matches, or ``None``."""
+    with Session(target) as session:
+        statement = select(FileRecord).where(FileRecord.sha256 == sha256)
+        return session.exec(statement).first()
+
+
+def list_file_records(
+    target: Engine = engine,
+    folder: str | None = None,
+    search: str | None = None,
+    sort: str = "date",
+    order: str = "desc",
+) -> list[FileRecord]:
+    """List file records with optional folder filter, name search, and sort.
+
+    Args:
+        target: SQLAlchemy engine to read from.
+        folder: If provided, restrict to entries in this folder (``""`` = root).
+        search: Case-insensitive substring match on ``source_file``.
+        sort: ``"name"``, ``"date"`` (``created_at``), or ``"type"`` (``source_mime``).
+        order: ``"asc"`` or ``"desc"``.
+    """
+    with Session(target) as session:
+        statement = select(FileRecord)
+        if folder is not None:
+            statement = statement.where(FileRecord.folder == folder)
+        if search:
+            # ``source_file`` is a SQLAlchemy column at class-attribute
+            # access; the descriptor exposes ``ilike`` but mypy reads the
+            # field's declared ``str`` type. The cast keeps the call site
+            # honest about the dual nature.
+            statement = statement.where(
+                cast(Any, FileRecord.source_file).ilike(f"%{search}%")
+            )
+        column: Any = {
+            "name": FileRecord.source_file,
+            "date": FileRecord.created_at,
+            "type": FileRecord.source_mime,
+        }.get(sort, FileRecord.created_at)
+        statement = statement.order_by(desc(column) if order == "desc" else column)
+        return list(session.exec(statement).all())
+
+
+def list_file_folders(target: Engine = engine) -> list[str]:
+    """Return the distinct, non-empty folder names in use."""
+    with Session(target) as session:
+        statement = select(FileRecord.folder).distinct()
+        return sorted({f for f in session.exec(statement).all() if f})
+
+
+def delete_file_record(file_id: str, target: Engine = engine) -> bool:
+    """Delete a file record. Returns True if a row was removed."""
+    with Session(target) as session:
+        record = session.get(FileRecord, file_id)
+        if record is None:
+            return False
+        session.delete(record)
+        session.commit()
+        return True
+
+
+def save_plan_snapshot(resolved: ResolvedPlan, target: Engine = engine) -> PlanSnapshotRecord:
+    """Persist a resolved plan; idempotent on ``plan_hash``.
+
+    Best-effort by design: a DB failure should not prevent the
+    generated G-code from being returned, so callers are expected to
+    log + swallow exceptions rather than propagating them.
+    """
+    record = PlanSnapshotRecord(
+        plan_hash=resolved.plan_hash,
+        profile_name=resolved.profile_name,
+        layer_count=len(resolved.layers),
+        created_at=datetime.now(UTC),
+        plan_json=resolved.model_dump_json(),
+        schema_version=PERSISTENCE_SCHEMA_VERSION,
+    )
+    try:
+        with Session(target) as session:
+            session.merge(record)
+            session.commit()
+    except Exception:  # pragma: no cover — diagnostics, never fatal
+        _log.exception("Failed to persist plan snapshot %s", resolved.plan_hash)
+    return record
+
+
+def get_plan_snapshot(plan_hash: str, target: Engine = engine) -> PlanSnapshotRecord | None:
+    """Return a stored snapshot by its hash, or ``None``."""
+    with Session(target) as session:
+        return session.get(PlanSnapshotRecord, plan_hash)
+
+
+def get_job(job_id: str, target: Engine = engine) -> JobRecord | None:
+    """Return a single job record by id, or ``None``.
+
+    Args:
+        job_id: The job identifier.
+        target: The engine to read from.
+
+    Returns:
+        The matching record, or ``None``.
+    """
+    with Session(target) as session:
+        return session.get(JobRecord, job_id)
+
+
+# ---------------------------------------------------------------- available colours
+
+
+def list_available_colors(target: Engine = engine) -> list[AvailableColorRecord]:
+    """Return every available-colour entry in display order.
+
+    Args:
+        target: The engine to read from.
+
+    Returns:
+        Records ordered by ``position`` ascending, ties broken by
+        ``created_at`` so a freshly-inserted row stays at the end of
+        the strip rather than jumping above a sibling with the same
+        position.
+    """
+    with Session(target) as session:
+        statement = select(AvailableColorRecord).order_by(
+            cast(Any, AvailableColorRecord.position),
+            cast(Any, AvailableColorRecord.created_at),
+        )
+        return list(session.exec(statement).all())
+
+
+def get_available_color(color_id: str, target: Engine = engine) -> AvailableColorRecord | None:
+    """Return one entry by id, or ``None`` if it doesn't exist."""
+    with Session(target) as session:
+        return session.get(AvailableColorRecord, color_id)
+
+
+def get_available_color_by_hex(
+    hex_value: str, target: Engine = engine
+) -> AvailableColorRecord | None:
+    """Return the (at most one) entry matching this hex, lookup helper for dedup."""
+    with Session(target) as session:
+        statement = select(AvailableColorRecord).where(AvailableColorRecord.hex == hex_value)
+        return session.exec(statement).first()
+
+
+def save_available_color(
+    record: AvailableColorRecord, target: Engine = engine
+) -> AvailableColorRecord:
+    """Insert or update an available-colour entry.
+
+    Uses ``session.merge`` so the same call works for both create and
+    update — the API adapter picks which path applies based on whether
+    the ``color_id`` already exists.
+    """
+    with Session(target) as session:
+        session.merge(record)
+        session.commit()
+    return record
+
+
+def delete_available_color(color_id: str, target: Engine = engine) -> bool:
+    """Remove one entry by id. Returns ``True`` if a row was deleted.
+
+    Args:
+        color_id: The identifier of the entry to drop.
+        target: The engine to write to.
+
+    Returns:
+        ``True`` if the row existed and was removed, ``False`` if the
+        id was already absent (so the endpoint can map to 404).
+    """
+    with Session(target) as session:
+        record = session.get(AvailableColorRecord, color_id)
+        if record is None:
+            return False
+        session.delete(record)
+        session.commit()
+        return True
+
+
+def next_available_color_position(target: Engine = engine) -> int:
+    """Return ``max(position) + 1`` so new entries land at the end of the strip.
+
+    Returns ``0`` when the table is empty so the first inserted row
+    starts at position 0.
+    """
+    with Session(target) as session:
+        statement = select(AvailableColorRecord).order_by(desc(AvailableColorRecord.position))
+        last = session.exec(statement).first()
+        return 0 if last is None else last.position + 1
+
+
+# ---------------------------------------------------------------- app settings
+
+
+def get_setting(key: str, target: Engine = engine) -> str | None:
+    """Return the raw string value of a setting, or ``None`` when unset."""
+    with Session(target) as session:
+        record = session.get(AppSettingRecord, key)
+        return None if record is None else record.value
+
+
+def set_setting(key: str, value: str, target: Engine = engine) -> None:
+    """Upsert a setting. ``value`` is stored as-is; callers JSON-encode if needed."""
+    with Session(target) as session:
+        session.merge(AppSettingRecord(key=key, value=value))
+        session.commit()

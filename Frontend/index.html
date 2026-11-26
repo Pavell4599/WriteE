@@ -40,6 +40,21 @@
             <button type="button" class="remove-file" id="remove-file" aria-label="УДАЛИТЬ ФАЙЛ">×</button>
           </div>
 
+          <div class="trace-options">
+            <label class="field-label" for="trace-mode">ОБВОДКА ИЗОБРАЖЕНИЯ</label>
+            <select id="trace-mode" name="trace_mode">
+              <option value="auto" selected>АВТО (КАК В INKSCAPE)</option>
+              <option value="brightness">КОНТУРЫ: ЛОГОТИПЫ И ТЁМНЫЕ ОБЛАСТИ</option>
+              <option value="edge">КРАЯ: ФОТО И ГРАДИЕНТЫ</option>
+            </select>
+            <label class="threshold-row" for="trace-threshold">
+              <span>ТОЧНОСТЬ ОБВОДКИ</span>
+              <output id="threshold-value">АВТО</output>
+            </label>
+            <input id="trace-threshold" type="range" min="0" max="1" step="0.05" value="0">
+            <p class="settings-note">АВТО выбирает режим по яркости и цветности. Для чистых чёрно-белых рисунков подходят «КОНТУРЫ», для фотографий — «КРАЯ». Каждый контур пойдёт отдельным штрихом без соединительных линий.</p>
+          </div>
+
           <div class="or-label"><span>ИЛИ</span></div>
           <label class="field-label" for="prompt">ТЕКСТ ДЛЯ РИСОВАНИЯ</label>
           <div class="prompt-composer surface">
@@ -74,6 +89,9 @@
             </div>
 
             <div class="settings">
+              <div class="preflight" id="preflight" aria-live="polite">
+                <span class="preflight-status">РАСЧЁТ ПРЕДПОЛЁТНОЙ ПРОВЕРКИ…</span>
+              </div>
               <label class="field-label" for="pen-lift-mode">ПОДЪЁМ ПЕРА</label>
               <select id="pen-lift-mode" name="pen_mode">
                 <option value="servo" selected>СЕРВО ЧЕРЕЗ FLUIDNC PWM</option>

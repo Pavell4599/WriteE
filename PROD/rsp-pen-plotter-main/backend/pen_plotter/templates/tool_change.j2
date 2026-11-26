@@ -1,0 +1,6 @@
+{% if park_x is not none and park_y is not none -%}
+{{ profile.pen_up_command }}
+G0 X{{ "%.3f"|format(park_x) }} Y{{ "%.3f"|format(park_y) }} F{{ "%.1f"|format(travel_feed) }}
+{% endif -%}
+; Change to pen slot {{ slot }} ({{ pen_name }})
+{{ profile.tool_change_command }}

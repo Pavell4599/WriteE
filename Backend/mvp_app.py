@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import ipaddress
 import logging
 import math
@@ -12,28 +10,24 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
-import vtracer
 from flask import Flask, jsonify, request, send_from_directory
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
-from g4f.client import Client
+import image_generation
+import inkscape_trace
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "Frontend"
-CONVERTER_DIR = ROOT / "Backend" / "svg2gcode_grbl"
+BACKEND_DIR = Path(__file__).resolve().parent
+CONVERTER_DIR = BACKEND_DIR / "svg2gcode_grbl"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_PIXELS = 16_000_000
 MAX_TRACE_SIDE = 1200
@@ -42,12 +36,8 @@ MAX_GCODE_BYTES = 5 * 1024 * 1024
 MAX_GCODE_LINES = 50_000
 JOB_TTL_SECONDS = 60 * 60
 FLUIDNC_PORT = 23
-PLOTTER_IMAGE_STYLE = (
-    "Create a clean black-and-white line drawing for a pen plotter. Use smooth, "
-    "simple contour outlines on a pure white background. Avoid shading, gray "
-    "tones, gradients, halftones, hatching, texture, large filled areas, and tiny details."
-)
 
+sys.path.insert(0, str(BACKEND_DIR))
 sys.path.insert(0, str(CONVERTER_DIR))
 import svg2gcode as svg_converter  # noqa: E402
 
@@ -134,7 +124,7 @@ def frontend_asset(asset: str):
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", vectorizer="vtracer", gcode="svg2gcode_grbl")
+    return jsonify(status="ok", vectorizer="inkscape-potrace", gcode="svg2gcode_grbl")
 
 
 def _validate_image(data: bytes) -> tuple[str, int, int]:
@@ -152,28 +142,12 @@ def _validate_image(data: bytes) -> tuple[str, int, int]:
     return image_format, width, height
 
 
-def _prepare_contour_image(data: bytes) -> bytes:
-    with Image.open(BytesIO(data)) as source:
-        image = ImageOps.exif_transpose(source).convert("L")
-
-    image.thumbnail((MAX_TRACE_SIDE, MAX_TRACE_SIDE), Image.Resampling.LANCZOS)
-    width, height = image.size
-    if width < 3 or height < 3:
-        raise ApiError("НА ИЗОБРАЖЕНИИ НЕ НАЙДЕНЫ КОНТУРЫ.", 422)
-
-    grayscale = np.frombuffer(image.tobytes(), dtype=np.uint8).reshape((height, width))
-    grayscale = cv2.normalize(grayscale, None, 0, 255, cv2.NORM_MINMAX)
-    grayscale = cv2.bilateralFilter(grayscale, 7, 50, 50)
-    edges = cv2.Canny(grayscale, 40, 100, L2gradient=True)
-    edges[[0, -1], :] = 0
-    edges[:, [0, -1]] = 0
-    if cv2.countNonZero(edges) == 0:
-        raise ApiError("НА ИЗОБРАЖЕНИИ НЕ НАЙДЕНЫ КОНТУРЫ.", 422)
-
-    contours = Image.fromarray(cv2.bitwise_not(edges))
-    output = BytesIO()
-    contours.save(output, format="PNG")
-    return output.getvalue()
+def _prepare_contour_image(data: bytes, mode: str = "auto") -> bytes:
+    """Intermediate Inkscape-style BW bitmap used by tests and debugging."""
+    try:
+        return inkscape_trace.prepare_debug_bitmap(data, MAX_TRACE_SIDE, mode)
+    except ValueError as error:
+        raise ApiError("НА ИЗОБРАЖЕНИИ НЕ НАЙДЕНЫ КОНТУРЫ.", 422) from error
 
 
 def _validate_svg(data: bytes) -> ET.Element:
@@ -220,112 +194,42 @@ def vectorize():
     if len(data) > MAX_UPLOAD_BYTES:
         raise ApiError("ФАЙЛ БОЛЬШЕ 20 МБ.", 413)
 
+    trace_mode = request.form.get("mode", "auto")
+    if trace_mode not in inkscape_trace.VALID_MODES:
+        raise ApiError("НЕИЗВЕСТНЫЙ РЕЖИМ ОБВОДКИ.")
+
+    threshold_raw = request.form.get("threshold")
+    threshold = None
+    if threshold_raw:
+        try:
+            threshold = float(threshold_raw)
+        except ValueError:
+            raise ApiError("ПОРОГ ОБВОДКИ ДОЛЖЕН БЫТЬ ЧИСЛОМ.")
+        if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ApiError("ПОРОГ ОБВОДКИ ДОЛЖЕН БЫТЬ ОТ 0 ДО 1.")
+
     if filename.lower().endswith(".svg") or uploaded.mimetype == "image/svg+xml":
         _validate_svg(data)
         svg = data.decode("utf-8-sig")
     else:
         _validate_image(data)
-        contour_data = _prepare_contour_image(data)
-        tracer = vtracer.Config.bw()
-        tracer.filter_speckle = 4
-        tracer.optimize = 2
         try:
-            svg = tracer.convert_bytes(contour_data)
+            svg = inkscape_trace.raster_to_svg(data, MAX_TRACE_SIDE, trace_mode, threshold)
+        except ValueError as error:
+            message = str(error).lower()
+            if "contour" in message or "small" in message:
+                raise ApiError("НА ИЗОБРАЖЕНИИ НЕ НАЙДЕНЫ КОНТУРЫ.", 422) from error
+            logger.exception("Inkscape-style Potrace failed")
+            raise ApiError("НЕ УДАЛОСЬ ПРЕОБРАЗОВАТЬ ИЗОБРАЖЕНИЕ В SVG.", 422) from error
         except Exception as error:
-            logger.exception("VTracer failed to process an image")
+            logger.exception("Inkscape-style Potrace failed")
             raise ApiError("НЕ УДАЛОСЬ ПРЕОБРАЗОВАТЬ ИЗОБРАЖЕНИЕ В SVG.", 422) from error
         _validate_svg(svg.encode("utf-8"))
 
-    return jsonify(svg=svg, filename=f"{Path(filename).stem or 'drawing'}.svg")
-
-
-def _response_field(item: Any, name: str) -> Any:
-    if isinstance(item, dict):
-        return item.get(name)
-    return getattr(item, name, None)
-
-
-def _validate_public_host(host: str) -> None:
-    try:
-        addresses = {entry[4][0] for entry in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
-    except OSError as error:
-        raise ApiError("НЕ УДАЛОСЬ НАЙТИ СЕРВЕР ИЗОБРАЖЕНИЯ.", 502) from error
-    if not addresses:
-        raise ApiError("СЕРВЕР ИЗОБРАЖЕНИЯ НЕ НАЙДЕН.", 502)
-    for address in addresses:
-        try:
-            parsed = ipaddress.ip_address(address)
-        except ValueError as error:
-            raise ApiError("НЕКОРРЕКТНЫЙ АДРЕС СЕРВЕРА ИЗОБРАЖЕНИЯ.", 502) from error
-        if not parsed.is_global:
-            raise ApiError("ССЫЛКА НА ИЗОБРАЖЕНИЕ ДОЛЖНА ВЕСТИ В ПУБЛИЧНУЮ СЕТЬ.", 502)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, _request, _response, _code, _message, _headers, _url):
-        return None
-
-
-def _download_generated_image(url: str) -> bytes:
-    for _ in range(4):
-        parsed = urllib.parse.urlsplit(url)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            raise ApiError("AI ВЕРНУЛ НЕКОРРЕКТНУЮ ССЫЛКУ НА ИЗОБРАЖЕНИЕ.", 502)
-        _validate_public_host(parsed.hostname)
-        request_image = urllib.request.Request(url, headers={"Accept": "image/*"})
-        opener = urllib.request.build_opener(_NoRedirect)
-        try:
-            with opener.open(request_image, timeout=15) as response:
-                if not response.headers.get("Content-Type", "").lower().startswith("image/"):
-                    raise ApiError("AI ВЕРНУЛ НЕ ИЗОБРАЖЕНИЕ.", 502)
-                data = response.read(MAX_UPLOAD_BYTES + 1)
-                if len(data) > MAX_UPLOAD_BYTES:
-                    raise ApiError("СГЕНЕРИРОВАННОЕ ИЗОБРАЖЕНИЕ БОЛЬШЕ 20 МБ.", 502)
-                return data
-        except urllib.error.HTTPError as error:
-            location = error.headers.get("Location")
-            if error.code not in {301, 302, 303, 307, 308} or not location:
-                raise ApiError("НЕ УДАЛОСЬ ЗАГРУЗИТЬ СГЕНЕРИРОВАННОЕ ИЗОБРАЖЕНИЕ.", 502) from error
-            url = urllib.parse.urljoin(url, location)
-        except (urllib.error.URLError, TimeoutError) as error:
-            raise ApiError("НЕ УДАЛОСЬ ЗАГРУЗИТЬ СГЕНЕРИРОВАННОЕ ИЗОБРАЖЕНИЕ.", 502) from error
-    raise ApiError("СЛИШКОМ МНОГО ПЕРЕАДРЕСАЦИЙ ПРИ ЗАГРУЗКЕ ИЗОБРАЖЕНИЯ.", 502)
-
-
-def _image_from_g4f(response: Any) -> bytes:
-    items = _response_field(response, "data")
-    if not items:
-        raise ApiError("AI НЕ ВЕРНУЛ ИЗОБРАЖЕНИЕ.", 502)
-    item = items[0]
-    encoded = _response_field(item, "b64_json")
-    if encoded:
-        if encoded.startswith("data:"):
-            encoded = encoded.split(",", 1)[-1]
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError) as error:
-            raise ApiError("AI ВЕРНУЛ ПОВРЕЖДЁННОЕ ИЗОБРАЖЕНИЕ.", 502) from error
-    else:
-        url = _response_field(item, "url")
-        if not isinstance(url, str):
-            raise ApiError("AI НЕ ВЕРНУЛ ССЫЛКУ ИЛИ ДАННЫЕ ИЗОБРАЖЕНИЯ.", 502)
-        if url.startswith("data:image/"):
-            try:
-                data = base64.b64decode(url.split(",", 1)[1], validate=True)
-            except (IndexError, binascii.Error, ValueError) as error:
-                raise ApiError("AI ВЕРНУЛ ПОВРЕЖДЁННОЕ ИЗОБРАЖЕНИЕ.", 502) from error
-        else:
-            data = _download_generated_image(url)
-    _validate_image(data)
-    return data
-
-
-def _normalize_png(data: bytes) -> bytes:
-    _validate_image(data)
-    with Image.open(BytesIO(data)) as image:
-        output = BytesIO()
-        image.convert("RGBA").save(output, format="PNG")
-    return output.getvalue()
+    root = ET.fromstring(svg)
+    path_count = sum(1 for element in root.iter() if element.tag.rsplit("}", 1)[-1].lower() == "path")
+    size = root.get("viewBox") or root.get("width", "0")
+    return jsonify(svg=svg, filename=f"{Path(filename).stem or 'drawing'}.svg", path_count=path_count, trace_mode=trace_mode, threshold=threshold, source_size=size)
 
 
 @app.post("/api/generate-image")
@@ -334,25 +238,23 @@ def generate_image():
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ApiError("ВВЕДИТЕ ОПИСАНИЕ ИЗОБРАЖЕНИЯ.")
-    if len(prompt) > 2_000:
+    if len(prompt) > image_generation.MAX_PROMPT_CHARS:
         raise ApiError("ОПИСАНИЕ ДОЛЖНО БЫТЬ КОРОЧЕ 2000 СИМВОЛОВ.")
     if body.get("allow_external") is not True:
         raise ApiError("ПОДТВЕРДИТЕ ОТПРАВКУ ТЕКСТА ВНЕШНЕМУ AI.")
 
     try:
-        result = Client().images.generate(
-            prompt=f"{prompt.strip()}\n\n{PLOTTER_IMAGE_STYLE}",
-            model="flux",
-            response_format="url",
-        )
-        image = _image_from_g4f(result)
-    except ApiError:
-        raise
+        image = image_generation.generate_plotter_image(prompt)
+    except image_generation.ImageGenerationError as error:
+        response = jsonify(error=str(error))
+        if error.retry_after:
+            response.headers["Retry-After"] = str(error.retry_after)
+        return response, error.status
     except Exception as error:
-        logger.exception("g4f image generation failed")
+        logger.exception("Image generation failed")
         raise ApiError("AI НЕ СМОГ СОЗДАТЬ ИЗОБРАЖЕНИЕ. ПОПРОБУЙТЕ ПОЗЖЕ.", 502) from error
 
-    return app.response_class(_normalize_png(image), mimetype="image/png")
+    return app.response_class(image, mimetype="image/png")
 
 
 def _number(body: dict[str, Any], name: str, default: float, minimum: float, maximum: float) -> float:
@@ -658,6 +560,111 @@ def fluidnc_send():
             job.state = "failed" if transmission_started else "ready"
         logger.exception("FluidNC G-code transmission failed")
         raise ApiError(f"ОТПРАВКА ОСТАНОВЛЕНА: {error}", 502) from error
+
+
+def _gcode_metrics(gcode: str, bed_width: float, bed_height: float, speed_mm_s: float, pen_mode: str = "z", servo_down_s: int = 800) -> dict[str, Any]:
+    x = y = z = 0.0
+    drawing_mm = 0.0
+    travel_mm = 0.0
+    drawing_points = 0
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    pen_down = False
+
+    for original in gcode.splitlines():
+        line = original.split(";", 1)[0].strip().upper()
+        match = re.fullmatch(r"(G0|G1)(?:\s+([XYZF][-+]?(?:\d+(?:\.\d*)?|\.\d+)))*", line)
+        if not match:
+            if line.startswith("M3 S"):
+                try:
+                    servo = int(line.split("S", 1)[1])
+                    pen_down = servo == (servo_down_s if pen_mode == "servo" else 800)
+                except (ValueError, IndexError):
+                    pass
+            continue
+        values = re.findall(r"([XYZ])([-+]?(?:\d+(?:\.\d*)?|\.\d+))", line)
+        next_x, next_y, next_z = x, y, z
+        for axis, raw in values:
+            if axis == "X": next_x = float(raw)
+            elif axis == "Y": next_y = float(raw)
+            elif axis == "Z": next_z = float(raw)
+        if next_z != z:
+            pen_down = next_z <= 0.5
+        length = math.hypot(next_x - x, next_y - y)
+        if pen_down:
+            drawing_mm += length
+            drawing_points += 1 if length > 0 else 0
+            min_x = min(min_x, x, next_x)
+            min_y = min(min_y, y, next_y)
+            max_x = max(max_x, x, next_x)
+            max_y = max(max_y, y, next_y)
+        else:
+            travel_mm += length
+        x, y, z = next_x, next_y, next_z
+
+    if not math.isfinite(min_x):
+        min_x = min_y = max_x = max_y = 0.0
+    width = max(0.0, max_x - min_x)
+    height = max(0.0, max_y - min_y)
+    estimated_seconds = (drawing_mm + travel_mm) / max(speed_mm_s, 0.1) * 1.15
+    outside = max_x > bed_width or max_y > bed_height or min_x < 0 or min_y < 0
+    return {
+        "drawing_length_mm": round(drawing_mm, 1),
+        "travel_length_mm": round(travel_mm, 1),
+        "estimated_seconds": round(estimated_seconds),
+        "bounds_mm": {"x": round(min_x, 1), "y": round(min_y, 1), "width": round(width, 1), "height": round(height, 1)},
+        "drawing_moves": drawing_points,
+        "outside_workspace": outside,
+        "warnings": (["РИСУНОК ВЫХОДИТ ЗА ПРЕДЕЛЫ РАБОЧЕГО ПОЛЯ."] if outside else []),
+    }
+
+
+@app.post("/api/preflight")
+def preflight():
+    body = _json_body()
+    svg_value = body.get("svg")
+    if not isinstance(svg_value, str):
+        raise ApiError("SVG НЕ ПЕРЕДАН.")
+    _validate_svg(svg_value.encode("utf-8"))
+    bed_width = _number(body, "bed_width_mm", 300, 1, 2000)
+    bed_height = _number(body, "bed_height_mm", 350, 1, 2000)
+    speed_mm_s = _number(body, "speed_mm_s", 5, 1, 100)
+
+    preview_body = dict(body)
+    preview_body.setdefault("pen_mode", "z")
+    pen_mode = preview_body["pen_mode"]
+    if pen_mode not in {"z", "servo"}:
+        raise ApiError("НЕИЗВЕСТНЫЙ СПОСОБ ПОДЪЁМА ПЕРА.")
+
+    with tempfile.TemporaryDirectory(prefix="writee-preflight-") as directory:
+        source = Path(directory) / "source.svg"
+        destination = Path(directory) / "preview.gcode"
+        source.write_text(svg_value, encoding="utf-8")
+        converter_values = {
+            "bed_max_x": bed_width, "bed_max_y": bed_height, "units": "mm",
+            "auto_scale": True, "optimise": False, "feed_rate": round(speed_mm_s * 60),
+            "zTravel": _number(preview_body, "z_up_mm", 4, -50, 50),
+            "zDraw": _number(preview_body, "z_down_mm", 0, -50, 50),
+            "placement_x": _number(preview_body, "offset_x_percent", 50, 0, 100) / 100,
+            "placement_y": _number(preview_body, "offset_y_percent", 50, 0, 100) / 100,
+            "pen_lift_mode": pen_mode,
+            "servo_up_s": _integer(preview_body, "servo_up_s", 700, 1, 10000),
+            "servo_down_s": _integer(preview_body, "servo_down_s", 800, 1, 10000),
+            "servo_delay_ms": _integer(preview_body, "servo_delay_ms", 300, 0, 2000),
+        }
+        with converter_lock:
+            previous = {key: getattr(svg_converter, key) for key in converter_values}
+            try:
+                for key, value in converter_values.items(): setattr(svg_converter, key, value)
+                svg_converter.main(str(source), str(destination))
+            finally:
+                for key, value in previous.items(): setattr(svg_converter, key, value)
+        gcode = destination.read_text(encoding="utf-8")
+    job = GcodeJob(gcode, bed_width, bed_height, converter_values["zTravel"], converter_values["zDraw"], time.time(), pen_mode, converter_values["servo_up_s"], converter_values["servo_down_s"])
+    commands = _validate_gcode(gcode, job)
+    metrics = _gcode_metrics(gcode, bed_width, bed_height, speed_mm_s, pen_mode, converter_values["servo_down_s"])
+    metrics["line_count"] = len(commands)
+    return jsonify(metrics)
 
 
 if __name__ == "__main__":

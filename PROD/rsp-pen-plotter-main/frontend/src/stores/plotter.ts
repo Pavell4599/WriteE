@@ -1,0 +1,293 @@
+import { defineStore } from 'pinia'
+import { computed, ref, watch } from 'vue'
+import { errorDetail } from '../api/error'
+import { i18n } from '../i18n'
+import { useToastStore } from './toasts'
+import {
+  listSerialPorts,
+  plotterCommand,
+  plotterConnect,
+  plotterDisconnect,
+  plotterGoto,
+  plotterHome,
+  plotterJog,
+  plotterRun,
+  plotterStatus,
+  websocketUrl,
+  type PlotterStatus,
+} from '../api/client'
+
+export const usePlotterStore = defineStore('plotter', () => {
+  const status = ref<PlotterStatus>({
+    connected: false,
+    total: 0,
+    sent: 0,
+    acked: 0,
+    state: 'idle',
+    message: null,
+  })
+  const port = ref('/dev/ttyUSB0')
+  const baudrate = ref(115200)
+  const terminator = ref<'cr' | 'lf' | 'crlf'>('lf')
+  const error = ref<string | null>(null)
+  let socket: WebSocket | null = null
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+
+  const progress = computed(() =>
+    status.value.total > 0 ? status.value.acked / status.value.total : 0,
+  )
+
+  function openSocket(): void {
+    if (socket) return
+    socket = new WebSocket(websocketUrl('/ws/plotter'))
+    socket.onmessage = (event) => {
+      try {
+        status.value = JSON.parse(event.data) as PlotterStatus
+      } catch {
+        // Ignore malformed frames; keep the last known status.
+      }
+    }
+    socket.onclose = () => {
+      socket = null
+      // Reconnect while we believe we're still connected to a device.
+      if (status.value.connected && reconnectTimer === null) {
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null
+          openSocket()
+        }, 2000)
+      }
+    }
+  }
+
+  // True while the live status stream is delivering frames. REST
+  // responses are snapshots taken when the request was *processed*; a
+  // WS frame emitted right after (more acked lines, state flip) is
+  // strictly fresher, so REST must not overwrite it.
+  function socketLive(): boolean {
+    return socket !== null && socket.readyState === WebSocket.OPEN
+  }
+
+  // Tear the socket down without triggering the auto-reconnect.
+  function closeSocket(): void {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    if (socket) {
+      const s = socket
+      socket = null
+      s.onclose = null
+      s.onmessage = null
+      try {
+        s.close()
+      } catch {
+        // Already closed / closing — nothing to do.
+      }
+    }
+  }
+
+  async function withErrors(
+    fn: () => Promise<PlotterStatus>,
+    progressMessage?: string,
+    successMessage?: string,
+  ): Promise<void> {
+    error.value = null
+    const toasts = useToastStore()
+    const toastId = progressMessage ? toasts.progress(progressMessage) : null
+    try {
+      const result = await fn()
+      // While the WebSocket is live it owns ``status`` — a REST snapshot
+      // arriving after newer WS frames would roll back the live
+      // progress (acked counter jumping backwards, state flicker).
+      if (!socketLive()) {
+        status.value = result
+      }
+      if (toastId !== null && successMessage) {
+        toasts.update(toastId, 'success', successMessage, 3000)
+      } else if (toastId !== null) {
+        toasts.dismiss(toastId)
+      }
+    } catch (err) {
+      const message = errorDetail(err, i18n.global.t('plotter.commandFailed'))
+      error.value = message
+      if (toastId !== null) {
+        toasts.update(toastId, 'error', message, 6000)
+      } else {
+        toasts.error(message)
+      }
+    }
+  }
+
+  // Re-learn the connection state after a page (re)load. The backend keeps the
+  // serial connection open across HTTP requests, but this store starts fresh
+  // with connected:false and only ever opens the /ws/plotter socket from
+  // connect()/detectAndConnect() — so a reload mid-print would show the cockpit
+  // as disconnected (controls disabled, progress frozen at 0) until the
+  // operator manually reconnects. Fetch the live status once on mount; if the
+  // machine is still connected, seed it and resume the progress stream.
+  let hydrated = false
+  async function hydrate(): Promise<void> {
+    if (hydrated) return
+    hydrated = true
+    try {
+      const result = await plotterStatus()
+      if (!socketLive()) status.value = result
+      if (result.connected) openSocket()
+    } catch {
+      // Backend unreachable at boot — leave the disconnected default; the
+      // operator can connect manually and normal error toasts cover real use.
+      hydrated = false
+    }
+  }
+
+  async function connect(): Promise<void> {
+    await withErrors(
+      () => plotterConnect(port.value, baudrate.value, terminator.value),
+      i18n.global.t('toast.plotterConnecting'),
+      i18n.global.t('toast.plotterConnected'),
+    )
+    if (status.value.connected) openSocket()
+  }
+
+  // « Détecter et connecter » (UX v2): enumerate the host's serial
+  // ports and try candidates in order (USB-serial adapters first,
+  // as sorted by the backend) with the current baudrate/terminator.
+  // The manual port field is updated to whatever worked, so the
+  // operator can see — and next time reuse — the detected device.
+  const detecting = ref(false)
+  async function detectAndConnect(): Promise<void> {
+    if (detecting.value) return
+    detecting.value = true
+    error.value = null
+    const toasts = useToastStore()
+    const toastId = toasts.progress(i18n.global.t('plotter.detecting'))
+    try {
+      const candidates = await listSerialPorts()
+      if (!candidates.length) {
+        toasts.update(toastId, 'error', i18n.global.t('plotter.noPortsFound'), 6000)
+        return
+      }
+      for (const candidate of candidates) {
+        try {
+          const result = await plotterConnect(candidate.device, baudrate.value, terminator.value)
+          if (result.connected) {
+            port.value = candidate.device
+            if (!socketLive()) status.value = result
+            toasts.update(
+              toastId,
+              'success',
+              i18n.global.t('plotter.connectedTo', { port: candidate.device }),
+              3000,
+            )
+            openSocket()
+            return
+          }
+        } catch {
+          // This candidate refused — try the next one.
+        }
+      }
+      toasts.update(toastId, 'error', i18n.global.t('plotter.detectFailed'), 6000)
+    } catch (err) {
+      const message = errorDetail(err, i18n.global.t('plotter.detectFailed'))
+      error.value = message
+      toasts.update(toastId, 'error', message, 6000)
+    } finally {
+      detecting.value = false
+    }
+  }
+
+  // Set while the operator explicitly disconnects so the connected→false
+  // transition that follows isn't mistaken for a mid-run *device loss* and
+  // alerted as one. Consumed by the watcher below on the next connected change.
+  let intentionalDisconnect = false
+
+  const disconnect = (): Promise<void> => {
+    // Close the stream FIRST so the REST response below is allowed to
+    // write the final (disconnected) status, and so the browser doesn't
+    // keep a dangling socket + reconnect timer alive after the operator
+    // explicitly disconnected.
+    intentionalDisconnect = true
+    closeSocket()
+    return withErrors(() => plotterDisconnect())
+  }
+  // True while a head movement (jog / goto / home) is in flight. Movement
+  // commands queue on the firmware, so without a guard a hammered jog pad
+  // dispatches a runaway stack of moves; the controls bind ``:disabled`` to
+  // this and ``withMovement`` early-returns as a hard backstop. Kept
+  // separate from transport (pause/resume/abort) so an in-flight move never
+  // disables the operator's ability to stop the machine.
+  const movementBusy = ref(false)
+  async function withMovement(
+    fn: () => Promise<PlotterStatus>,
+    progressMessage?: string,
+  ): Promise<void> {
+    if (movementBusy.value) return
+    movementBusy.value = true
+    try {
+      await withErrors(fn, progressMessage)
+    } finally {
+      movementBusy.value = false
+    }
+  }
+  // Jog steps are small + quick — a per-press toast would spam, so only the
+  // busy guard applies. Goto / home can take seconds, so they surface a
+  // progress toast that auto-dismisses when the move lands.
+  const jog = (dx: number, dy: number, profileName: string, dz = 0): Promise<void> =>
+    withMovement(() => plotterJog(dx, dy, profileName, dz))
+  const goto = (x: number, y: number, profileName: string): Promise<void> =>
+    withMovement(() => plotterGoto(x, y, profileName), i18n.global.t('toast.plotterMoving'))
+  const home = (profileName: string, axis?: 'X' | 'Y' | 'Z'): Promise<void> =>
+    withMovement(() => plotterHome(profileName, axis), i18n.global.t('toast.plotterHoming'))
+  const run = (gcode: string): Promise<void> =>
+    withErrors(
+      () => plotterRun(gcode),
+      i18n.global.t('toast.plotterSending'),
+      i18n.global.t('toast.plotterSent'),
+    )
+  const pause = (): Promise<void> => withErrors(() => plotterCommand('pause'))
+  const resume = (): Promise<void> => withErrors(() => plotterCommand('resume'))
+  const abort = (): Promise<void> => withErrors(() => plotterCommand('abort'))
+
+  // Mid-run device disconnect is operator-blocking: the job halts,
+  // the head position becomes unreliable, and silent recovery would
+  // leave the operator confused. Detect the transition (connected →
+  // disconnected) while a run is in progress and push a persistent
+  // critical toast so the alert can't vanish behind other notifs.
+  // Array-form ``watch`` so Vue compares each scalar source by
+  // reference; an object-literal getter would re-trigger on every
+  // WebSocket frame even when the relevant fields didn't move.
+  watch(
+    [() => status.value.connected, () => status.value.state],
+    ([nextConnected, _nextState], [prevConnected, prevState]) => {
+      const wasRunning = prevState === 'running' || prevState === 'paused'
+      if (prevConnected && !nextConnected && wasRunning && !intentionalDisconnect) {
+        useToastStore().critical(i18n.global.t('plotter.deviceLost'))
+      }
+      // Consume the flag on the connection transition so a genuine loss later
+      // (which the operator did not initiate) still raises the alert.
+      if (nextConnected !== prevConnected) intentionalDisconnect = false
+    },
+  )
+
+  return {
+    status,
+    port,
+    baudrate,
+    terminator,
+    error,
+    progress,
+    movementBusy,
+    hydrate,
+    connect,
+    detecting,
+    detectAndConnect,
+    disconnect,
+    jog,
+    goto,
+    home,
+    run,
+    pause,
+    resume,
+    abort,
+  }
+})

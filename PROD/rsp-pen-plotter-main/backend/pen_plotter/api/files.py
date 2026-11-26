@@ -1,0 +1,681 @@
+"""HTTP adapter for the file library — upload, list, fetch, dedup, integrity.
+
+All disk layout, persistence, segmentation cache and integrity logic
+live in :mod:`pen_plotter.application.file_library`. This module owns
+only the HTTP wire shape and the upload orchestration.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import os
+import shutil
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
+
+from pen_plotter.api.upload_limits import max_upload_bytes as _max_upload_bytes
+from pen_plotter.application.color_assignment import auto_assign_layer_colors
+from pen_plotter.application.file_library import (
+    FileMeta,
+    InsufficientStorageError,
+    IntegrityReport,
+    ensure_upload_space,
+    file_dir,
+    find_original,
+    forget_job,
+    integrity_scan,
+    read_meta,
+    read_meta_or_empty,
+    read_svg,
+    remember_job,
+)
+from pen_plotter.application.palette_pool import active_pool
+from pen_plotter.application.preview_raster import (
+    UnsupportedFormatError,
+    is_passthrough,
+    rasterize_source,
+)
+from pen_plotter.converters.pipeline import (
+    convert_file,
+    parse_options,
+    read_upload_safely,
+    resolve_mime,
+)
+from pen_plotter.persistence import (
+    PERSISTENCE_SCHEMA_VERSION,
+    FileRecord,
+    delete_file_record,
+    get_file_record,
+    get_file_record_by_hash,
+    list_file_folders,
+    list_file_records,
+    save_file_record,
+)
+
+router = APIRouter()
+
+MAX_UPLOAD_BYTES = _max_upload_bytes()
+
+# Per-file_id locks so a reconversion and a delete (or two reconversions) of the
+# same file can't interleave their artefact swaps and leave a mixed
+# normalized.svg / original / meta.json (P1.7). Keyed per event loop so a second
+# TestClient doesn't reuse locks bound to a dead loop.
+_file_locks: dict[str, asyncio.Lock] = {}
+_file_locks_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _file_lock(file_id: str) -> asyncio.Lock:
+    """Return the per-file lock for ``file_id`` (rebuilt on loop change)."""
+    global _file_locks_loop
+    loop = asyncio.get_running_loop()
+    if _file_locks_loop is not loop:
+        _file_locks.clear()
+        _file_locks_loop = loop
+    lock = _file_locks.get(file_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _file_locks[file_id] = lock
+    return lock
+
+# Folder is a free-form label stored in the FileRecord row, never
+# joined onto a filesystem path on disk (the file_id — a UUID — is the
+# only path component). The guard below still rejects shapes that
+# could be misread by an admin tool, a CLI export, or a future
+# refactor that does build a path from this string — defence in depth
+# at the API edge.
+_FORBIDDEN_FOLDER_CHARS = ("/", "\\", "\x00")
+_MAX_FOLDER_LEN = 128
+
+
+def _sanitize_folder(folder: str) -> str:
+    """Validate the operator-supplied folder label.
+
+    Strips surrounding whitespace, rejects path separators / NULs /
+    parent-directory traversal hints, and caps the length so a single
+    pathological folder name can't blow up the search index.
+
+    Raises:
+        HTTPException: 400 if the label is unsafe. The error message
+            tells the operator what was wrong so they can correct it.
+    """
+    folder = folder.strip()
+    if not folder:
+        return ""
+    if len(folder) > _MAX_FOLDER_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder name must be at most {_MAX_FOLDER_LEN} characters.",
+        )
+    if any(c in folder for c in _FORBIDDEN_FOLDER_CHARS):
+        raise HTTPException(
+            status_code=400,
+            detail="Folder name cannot contain slashes, backslashes or NUL.",
+        )
+    if folder in {".", ".."} or folder.startswith(".."):
+        raise HTTPException(
+            status_code=400,
+            detail="Folder name cannot be '.' or '..' or start with '..'.",
+        )
+    return folder
+
+
+# Test compatibility: ``FILES_DIR`` is the conventional monkey-patch
+# point used by tests to redirect the library to a temp dir. The
+# application service reads this attribute at call time (see
+# ``file_library.files_dir``) so the override flows through.
+_DEFAULT_FILES_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "files"
+FILES_DIR = Path(os.environ.get("OMNIPLOT_FILES_DIR", _DEFAULT_FILES_DIR))
+
+# Backwards-compatible aliases. Callers that imported these private
+# helpers from this module keep working; new code should import them
+# from ``application.file_library`` directly.
+_file_dir = file_dir
+_find_original = find_original
+
+
+class FileRecordOut(BaseModel):
+    """Public projection of a :class:`FileRecord`, ready for JSON."""
+
+    file_id: str
+    sha256: str
+    source_file: str
+    source_mime: str
+    size_bytes: int
+    layer_count: int
+    folder: str
+    created_at: datetime
+
+
+class FileDetail(FileRecordOut):
+    """Library entry plus its converted SVG and per-file metadata."""
+
+    svg: str
+    layers: list[Any]  # LayerInfo; widened to Any to avoid a cycle through models
+    warnings: list[str] = []
+    upload_metadata: dict[str, Any] = {}
+    rerenderable: bool = False
+
+
+class FileUploadResponse(BaseModel):
+    """Result of uploading to the library; ``existing`` flags dedup hits."""
+
+    file: FileDetail
+    existing: bool
+
+
+class FilePatch(BaseModel):
+    """In-place edit of a library entry — rename and/or move between folders."""
+
+    source_file: str | None = None
+    folder: str | None = None
+
+
+def _record_to_out(record: FileRecord) -> FileRecordOut:
+    return FileRecordOut(
+        file_id=record.file_id,
+        sha256=record.sha256,
+        source_file=record.source_file,
+        source_mime=record.source_mime,
+        size_bytes=record.size_bytes,
+        layer_count=record.layer_count,
+        folder=record.folder,
+        created_at=record.created_at,
+    )
+
+
+def _backfill_page_size(
+    upload_metadata: dict[str, Any], bitmap_options: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Backfill a bitmap entry's page size from its stored target footprint.
+
+    Heals library entries saved before the bitmap converter began reporting
+    its page size, so a drag-drop restores the placement at the operator's
+    chosen physical size instead of rescaling the raster to fill the bed.
+    New entries already carry the page size and return unchanged.
+    """
+    if upload_metadata.get("page_width_mm") and upload_metadata.get("page_height_mm"):
+        return upload_metadata
+    if not bitmap_options:
+        return upload_metadata
+    raw_width = bitmap_options.get("target_width_mm")
+    raw_height = bitmap_options.get("target_height_mm")
+    if raw_width is None or raw_height is None:
+        return upload_metadata
+    try:
+        width_mm = float(raw_width)
+        height_mm = float(raw_height)
+    except (TypeError, ValueError):
+        return upload_metadata
+    if width_mm <= 0 or height_mm <= 0:
+        return upload_metadata
+    return {**upload_metadata, "page_width_mm": width_mm, "page_height_mm": height_mm}
+
+
+def _record_to_detail(record: FileRecord) -> FileDetail:
+    meta = read_meta_or_empty(record.file_id)
+    svg = read_svg(record.file_id)
+    if svg is None:
+        raise HTTPException(status_code=410, detail="Stored SVG is missing on disk")
+    return FileDetail(
+        **_record_to_out(record).model_dump(),
+        svg=svg,
+        layers=meta.layers,
+        warnings=meta.warnings,
+        upload_metadata=_backfill_page_size(meta.upload_metadata, meta.bitmap_options),
+        rerenderable=meta.rerenderable,
+    )
+
+
+def _options_changed(file_id: str, new_options: dict[str, Any]) -> bool:
+    """Detect a real settings edit between two upload requests.
+
+    Returns ``True`` when ``new_options`` differs from what was used
+    to produce the stored file. Empty / missing ``new_options`` is
+    treated as "no change" — a plain library-pick re-upload that
+    just wants the existing entry, not a settings edit.
+    """
+    if not new_options:
+        return False
+    meta = read_meta_or_empty(file_id)
+    # Bitmap path: stored as BitmapOptions, normalize both sides so a
+    # request that omits an implicit default doesn't trigger a false
+    # re-conversion.
+    stored_bitmap = meta.bitmap_options
+    if stored_bitmap is not None:
+        try:
+            from pen_plotter.converters.bitmap import BitmapOptions
+
+            a = BitmapOptions.model_validate(stored_bitmap).model_dump()
+            b = BitmapOptions.model_validate({**stored_bitmap, **new_options}).model_dump()
+            return a != b
+        except Exception:
+            # Fall through to the raw-dict compare so non-bitmap
+            # converters still detect their settings edits.
+            pass
+    # Non-bitmap converters (typography / markdown / svg / …): compare
+    # against the raw options dict that produced the file.
+    stored = meta.source_options or {}
+    return {**stored, **new_options} != stored
+
+
+def _reprocess_existing(
+    record: FileRecord,
+    data: bytes,
+    mime: str,
+    new_options: dict[str, Any],
+) -> FileRecord:
+    """Re-convert and overwrite the stored artefacts for an existing entry.
+
+    Keeps ``file_id`` and the SHA-256 stable so library references / the
+    /rerender cache key don't break; the operator's settings edit is
+    visible on the next /files/<id> read. Also refreshes the rerender
+    cache so the next /rerender skips the rehydration step.
+    """
+    converted = convert_file(data, record.source_file, mime, new_options)
+    directory = file_dir(record.file_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    # Auto-attribute every cluster centroid to its nearest pool ink before
+    # the meta is sealed. The library upload is profile-agnostic (no pen
+    # rack in scope here), so ``active_pool(None)`` honours the operator's
+    # ``palette_source`` choice for the pools that don't need a profile —
+    # ``available`` / ``union`` snap to the inventory; ``pens`` resolves to
+    # an empty pool, which clears the auto value so the editor's re-snap
+    # (driven by the selected profile's installed pens) fills it in.
+    assigned_layers = auto_assign_layer_colors(converted.layers, active_pool(None))
+    meta = FileMeta(
+        layers=assigned_layers,
+        warnings=converted.warnings,
+        upload_metadata=converted.metadata,
+        rerenderable=converted.bitmap_segmentation is not None,
+        bitmap_options=(
+            converted.bitmap_options.model_dump() if converted.bitmap_options is not None else None
+        ),
+        source_options=dict(new_options) if new_options else None,
+    )
+    original_name = f"original{_ext_for(record.source_file, converted.source_mime)}"
+
+    # Reconversion overwrites live artefacts (normalized.svg / original /
+    # meta.json). Writing them in place would leave the entry inconsistent if
+    # the process died mid-write — a torn file, or a new SVG paired with the
+    # old meta. Instead stage every artefact in a sibling temp dir, then move
+    # each into place with an atomic ``os.replace``, sealing meta.json LAST so
+    # a concurrent reader never sees fresh metadata pointing at a stale SVG.
+    # Reconversion writes a fresh full copy into staging, so it too must fit
+    # under the free-space reserve (P1.8) — refuse before staging anything.
+    ensure_upload_space(len(data) + len(converted.svg.encode("utf-8")) + 64 * 1024)
+    staging = directory.with_name(f".tmp-reprocess-{record.file_id}-{uuid.uuid4().hex}")
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        (staging / "normalized.svg").write_text(converted.svg, encoding="utf-8")
+        (staging / original_name).write_bytes(data)
+        (staging / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+        os.replace(staging / "normalized.svg", directory / "normalized.svg")
+        # Drop any prior original whose extension differs from the new one
+        # (the operator may have re-uploaded the same content under a new
+        # filename) before swapping the fresh bytes in.
+        for stale in directory.iterdir():
+            if stale.is_file() and stale.stem == "original" and stale.name != original_name:
+                stale.unlink(missing_ok=True)
+        os.replace(staging / original_name, directory / original_name)
+        os.replace(staging / "meta.json", directory / "meta.json")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    # Update DB row: layer_count and source_mime may have shifted; keep
+    # file_id, sha256, folder, created_at.
+    updated = FileRecord(
+        file_id=record.file_id,
+        sha256=record.sha256,
+        source_file=record.source_file,
+        source_mime=converted.source_mime,
+        size_bytes=len(data),
+        layer_count=len(converted.layers),
+        folder=record.folder,
+        created_at=record.created_at,
+        schema_version=PERSISTENCE_SCHEMA_VERSION,
+    )
+    save_file_record(updated)
+
+    # Refresh the /rerender cache so the segmentation matches the new
+    # SVG. Dropping the old entry first avoids a stale palette + new
+    # algorithm mismatch on the next request.
+    forget_job(record.file_id)
+    if converted.bitmap_segmentation is not None and converted.bitmap_options is not None:
+        remember_job(record.file_id, converted.bitmap_segmentation, converted.bitmap_options)
+    return updated
+
+
+def _ext_for(filename: str | None, mime: str) -> str:
+    """Pick a sensible extension for the stored original."""
+    if filename and "." in filename:
+        return "." + filename.rsplit(".", 1)[-1].lower()
+    # Best-effort fallback by MIME.
+    return {
+        "image/svg+xml": ".svg",
+        "application/pdf": ".pdf",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "text/html": ".html",
+        "text/markdown": ".md",
+        "text/plain": ".txt",
+        "application/postscript": ".ps",
+        "image/x-eps": ".eps",
+        "image/vnd.dxf": ".dxf",
+    }.get(mime, ".bin")
+
+
+@router.post("/files")
+async def upload_to_library(
+    file: Annotated[UploadFile, File()],
+    folder: Annotated[str, Form()] = "",
+    options: Annotated[str | None, Form()] = None,
+) -> FileUploadResponse:
+    """Add a file to the library, deduplicating by content hash.
+
+    If a file with the same SHA-256 already exists, the existing record is
+    returned and ``existing`` is ``true`` — no second copy is stored.
+    Exception: when the request carries conversion ``options`` (e.g. the
+    operator changed the bitmap algorithm or palette in SourceSection and
+    clicked Apply), and those options differ from what was used last time,
+    we re-process the file in place — overwriting ``normalized.svg`` and
+    ``meta.json`` — instead of silently returning the stale conversion.
+    Without this branch the operator's option edits would never reach the
+    plotter, because the editor re-uploads the same bytes to apply changes.
+    """
+    mime = resolve_mime(file)
+    if mime is None:
+        raise HTTPException(status_code=415, detail="Could not determine file type")
+
+    folder = _sanitize_folder(folder)
+    data = await read_upload_safely(file, _max_upload_bytes())
+    parsed_options = parse_options(options)
+
+    digest = hashlib.sha256(data).hexdigest()
+    existing = get_file_record_by_hash(digest)
+    if existing is not None:
+        if _options_changed(existing.file_id, parsed_options):
+            # ``_reprocess_existing`` calls the CPU-bound converter and writes
+            # to disk — both block the event loop. Run it in the threadpool so
+            # the server keeps serving other requests (listings, previews,
+            # concurrent uploads) while the conversion churns.
+            # Serialise per file: two reconversions (or a reconvert racing a
+            # delete) of the same file must not interleave their swaps (P1.7).
+            async with _file_lock(existing.file_id):
+                try:
+                    updated = await run_in_threadpool(
+                        _reprocess_existing, existing, data, mime, parsed_options
+                    )
+                except InsufficientStorageError as exc:
+                    raise HTTPException(status_code=507, detail=str(exc)) from exc
+            return FileUploadResponse(file=_record_to_detail(updated), existing=True)
+        return FileUploadResponse(file=_record_to_detail(existing), existing=True)
+
+    # New content: refuse to write when the disk is at its reserve — a
+    # saturated SD card corrupts SQLite and drops the print queue (P0.5).
+    # Dedup returns above already short-circuited, so a re-upload of bytes
+    # already in the library is never blocked here.
+    try:
+        ensure_upload_space(len(data))
+    except InsufficientStorageError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    # Conversion is the dominant, fully synchronous cost of an upload
+    # (segmentation, potrace, vpype, …). Off-load it to the threadpool so a
+    # heavy file on a Pi-class device doesn't freeze the whole API for every
+    # other client while it runs.
+    converted = await run_in_threadpool(convert_file, data, file.filename, mime, parsed_options)
+
+    # Re-check now that the true footprint is known (P1.8): a dense
+    # vectorisation can make normalized.svg dwarf the uploaded bytes, so the
+    # pre-conversion ``len(data)`` guard alone under-counts what the commit
+    # writes (original + SVG + meta).
+    try:
+        ensure_upload_space(len(data) + len(converted.svg.encode("utf-8")) + 64 * 1024)
+    except InsufficientStorageError as exc:
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+
+    file_id = str(uuid.uuid4())
+    # Same auto-attribution as ``_reprocess_existing`` — keep the two
+    # paths bit-identical so a re-upload-with-changed-options doesn't
+    # accidentally regress to raw centroid colours when the inventory
+    # is populated. ``active_pool(None)`` honours ``palette_source``.
+    assigned_layers = auto_assign_layer_colors(converted.layers, active_pool(None))
+    # Write all artefacts into a staging directory and only rename it to
+    # its final name once every file is on disk. Guarantees an interrupted
+    # upload can never leave the library half-populated.
+    final_dir = file_dir(file_id)
+    staging = final_dir.with_name(f".tmp-{file_id}")
+    try:
+        staging.mkdir(parents=True, exist_ok=False)
+        (staging / "normalized.svg").write_text(converted.svg, encoding="utf-8")
+        original = staging / f"original{_ext_for(file.filename, converted.source_mime)}"
+        original.write_bytes(data)
+        meta = FileMeta(
+            layers=assigned_layers,
+            warnings=converted.warnings,
+            upload_metadata=converted.metadata,
+            rerenderable=converted.bitmap_segmentation is not None,
+            bitmap_options=(
+                converted.bitmap_options.model_dump()
+                if converted.bitmap_options is not None
+                else None
+            ),
+            source_options=dict(parsed_options) if parsed_options else None,
+        )
+        (staging / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+        staging.rename(final_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    record = FileRecord(
+        file_id=file_id,
+        sha256=digest,
+        source_file=converted.source_file,
+        source_mime=converted.source_mime,
+        size_bytes=len(data),
+        layer_count=len(converted.layers),
+        folder=folder,
+        created_at=datetime.now(UTC),
+        schema_version=PERSISTENCE_SCHEMA_VERSION,
+    )
+    try:
+        save_file_record(record)
+    except IntegrityError:
+        # Dedup TOCTOU: a concurrent identical upload won the race between
+        # our hash check above and this insert — the unique ``sha256`` index
+        # rejected the second row. Clean up our orphaned artefact directory
+        # and return the winner's record so the dedup stays idempotent
+        # instead of surfacing a 500.
+        shutil.rmtree(final_dir, ignore_errors=True)
+        winner = get_file_record_by_hash(digest)
+        if winner is None:  # pragma: no cover — index hit but row vanished
+            raise
+        return FileUploadResponse(file=_record_to_detail(winner), existing=True)
+
+    if converted.bitmap_segmentation is not None and converted.bitmap_options is not None:
+        # Cache under the file_id so /rerender can find the segmentation
+        # when the UI later derives a job_id from this library file.
+        remember_job(file_id, converted.bitmap_segmentation, converted.bitmap_options)
+
+    return FileUploadResponse(file=_record_to_detail(record), existing=False)
+
+
+@router.get("/files/integrity")
+async def files_integrity() -> IntegrityReport:
+    """Return the integrity report for the file library.
+
+    Lets the UI surface a banner ("3 file(s) need re-upload to support
+    style editing") instead of failing on the next /rerender click.
+    """
+    return integrity_scan()
+
+
+@router.get("/files")
+async def list_files(
+    folder: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    sort: str = Query(default="date"),
+    order: str = Query(default="desc"),
+) -> list[FileRecordOut]:
+    """List library entries. Filters/sort applied server-side."""
+    if sort not in {"name", "date", "type"}:
+        raise HTTPException(status_code=400, detail="sort must be one of name|date|type")
+    if order not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="order must be asc|desc")
+    records = list_file_records(folder=folder, search=search, sort=sort, order=order)
+    return [_record_to_out(r) for r in records]
+
+
+@router.get("/files/folders")
+async def list_folders() -> list[str]:
+    """Return the distinct folder names currently used by library entries."""
+    return list_file_folders()
+
+
+@router.get("/files/by-hash/{sha256}")
+async def get_file_by_hash(sha256: str) -> FileDetail:
+    """Look up a library entry by its content SHA-256.
+
+    Lets the uploader skip the upload + convert round-trip entirely when the
+    bytes are already in the library: the client hashes the file locally and
+    calls this first. Returns the same :class:`FileDetail` the upload endpoint
+    would, so the frontend can merge it as a dedup hit. 404 when unknown.
+
+    Declared before ``/files/{file_id}`` so the literal ``by-hash`` segment is
+    never swallowed by the file-id route.
+    """
+    record = get_file_record_by_hash(sha256.strip().lower())
+    if record is None:
+        raise HTTPException(status_code=404, detail="No library file with that hash")
+    return _record_to_detail(record)
+
+
+@router.get("/files/{file_id}")
+async def get_file(file_id: str) -> FileDetail:
+    """Return one library entry, including its SVG and layer metadata."""
+    record = get_file_record(file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown file: {file_id!r}")
+    return _record_to_detail(record)
+
+
+@router.get("/files/{file_id}/original")
+async def download_original(file_id: str) -> FileResponse:
+    """Stream the original uploaded bytes back to the client."""
+    record = get_file_record(file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown file: {file_id!r}")
+    original = find_original(file_id)
+    if original is None:
+        raise HTTPException(status_code=410, detail="Original file is missing on disk")
+    return FileResponse(
+        path=original,
+        media_type=record.source_mime,
+        filename=record.source_file,
+    )
+
+
+@router.get("/files/{file_id}/preview-image")
+async def file_preview_image(
+    file_id: str,
+    page: int = Query(default=0, ge=0),
+) -> Response:
+    """Return a PNG raster of the original source for the editor preview.
+
+    Image sources are streamed back as-is (no re-encode) so JPEG quality
+    survives. Vector / document sources (PDF, SVG, DOCX, ODT, RTF, HTML,
+    EPS, PS, AI) are rendered to PNG through PyMuPDF / LibreOffice /
+    Ghostscript — the "Original" and "Compare" modes in the editor
+    finally work for them instead of being hidden behind a bitmap-only
+    check. Formats with no useful raster representation (TXT, MD, DXF)
+    return 415 so the UI can fall back to the existing text / empty
+    placeholder instead of showing a broken ``<img>``.
+    """
+    record = get_file_record(file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown file: {file_id!r}")
+    original = find_original(file_id)
+    if original is None:
+        raise HTTPException(status_code=410, detail="Original file is missing on disk")
+    ext = original.suffix.lower()
+    if is_passthrough(ext):
+        return FileResponse(path=original, media_type=record.source_mime)
+    try:
+        png_bytes = await run_in_threadpool(rasterize_source, original, page)
+    except UnsupportedFormatError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return Response(content=png_bytes, media_type="image/png")
+
+
+@router.patch("/files/{file_id}")
+async def patch_file(file_id: str, patch: FilePatch) -> FileRecordOut:
+    """Rename a library entry and/or move it to another folder."""
+    record = get_file_record(file_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown file: {file_id!r}")
+    if patch.source_file is not None:
+        name = patch.source_file.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="source_file cannot be empty")
+        record.source_file = name
+    if patch.folder is not None:
+        record.folder = _sanitize_folder(patch.folder)
+    save_file_record(record)
+    return _record_to_out(record)
+
+
+@router.delete("/files/{file_id}")
+async def delete_file(file_id: str) -> dict[str, bool]:
+    """Remove a library entry and its on-disk artifacts."""
+    # Hold the per-file lock so a delete can't race a concurrent reconversion of
+    # the same file, and rmtree off the event loop so a large tree on a slow SD
+    # card doesn't stall other requests (P1.7).
+    async with _file_lock(file_id):
+        if not delete_file_record(file_id):
+            raise HTTPException(status_code=404, detail=f"Unknown file: {file_id!r}")
+        directory = file_dir(file_id)
+        if directory.is_dir():
+            await run_in_threadpool(shutil.rmtree, directory, ignore_errors=True)
+        # Evict the in-memory /rerender segmentation cache too, or a deleted
+        # file keeps rendering (POST /rerender {job_id: <deleted>}) until LRU
+        # eviction. The reprocess path already does this.
+        forget_job(file_id)
+    # The file is gone — drop its per-file lock so the dict can't grow without
+    # bound on a long-running appliance. Any later access to this id 404s (the
+    # record is gone), and _file_lock() re-creates a lock on demand regardless.
+    _file_locks.pop(file_id, None)
+    return {"ok": True}
+
+
+__all__ = [
+    "FILES_DIR",
+    "FileDetail",
+    "FileMeta",
+    "FilePatch",
+    "FileRecordOut",
+    "FileUploadResponse",
+    "IntegrityReport",
+    "MAX_UPLOAD_BYTES",
+    "find_original",
+    "read_meta",
+    "router",
+]

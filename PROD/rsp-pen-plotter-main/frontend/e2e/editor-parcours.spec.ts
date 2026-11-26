@@ -1,0 +1,132 @@
+// Editor parcours — real browser E2E (audit Phase 3).
+//
+// Drives the headline editor flow end-to-end in a real browser: upload a
+// file, open the V2 editor, wait for the live preview, change the intent
+// and palette, switch to expert mode and back, and generate. This is the
+// browser-level complement to the component-integration coverage in
+// ``src/components/v2/EditModalV2.test.ts`` (which exercises the same
+// scenarios against mounted Vue + Pinia, but not the real network wiring).
+//
+// REQUIREMENTS / HOW TO RUN
+//   The flow needs the FastAPI backend up (upload → segmentation → render
+//   are real round-trips) AND a Playwright browser installed. It is gated
+//   on ``E2E_BACKEND_RUNNING=1`` exactly like ``operator-parcours.spec.ts``
+//   so the default Vite-only suite skips it instead of failing:
+//
+//     npx playwright install --with-deps chromium
+//     OMNIPLOT_FAKE_HARDWARE=1 <start backend on :8000>
+//     E2E_BACKEND_RUNNING=1 npm run e2e
+//
+//   The CI ``e2e`` job (.github/workflows/ci.yml) boots the fake-hardware
+//   backend, installs Chromium and sets ``E2E_BACKEND_RUNNING=1``, so this
+//   spec runs there alongside the other Playwright specs — it is a real gate,
+//   not authoring-only scaffolding.
+
+import { fileURLToPath } from 'node:url'
+import { expect, test } from '@playwright/test'
+
+const backendUp = process.env.E2E_BACKEND_RUNNING === '1'
+const FIXTURE = fileURLToPath(new URL('./fixtures/checker.png', import.meta.url))
+
+test.describe('Editor parcours (assisted → expert → generate)', () => {
+  test.skip(!backendUp, 'requires E2E_BACKEND_RUNNING=1 with the backend on :8000')
+
+  test.beforeEach(async ({ page }) => {
+    // The first-run welcome tour overlays the modal body (which turns
+    // ``inert``) and intercepts every click, so the parcours below must
+    // run as a returning operator. Seed the "seen" flag before the app
+    // boots; the tour itself is covered by the dedicated first-run test.
+    await page.addInitScript(() => {
+      window.localStorage.setItem('omniplot.onboarding.editorV2.v1', JSON.stringify({ seen: true }))
+    })
+    await page.goto('/')
+    await expect(page.locator('[data-test="header-version-badge"]')).toBeVisible()
+  })
+
+  async function uploadAndOpenEditor(page: import('@playwright/test').Page) {
+    // The file <input> is hidden; set files on it directly rather than
+    // clicking the button that proxies to it.
+    await page.locator('input[type="file"]').setInputFiles(FIXTURE)
+    // The uploaded file lands as a row in the Files pane once the backend
+    // finishes segmentation.
+    const row = page.locator('[data-test="file-row"]').first()
+    await expect(row).toBeVisible({ timeout: 20_000 })
+    // Open the editor on it.
+    await row.locator('[data-test="file-row-edit"]').click()
+    await expect(page.locator('[data-test="modal-v2-layout"]')).toBeVisible({ timeout: 20_000 })
+  }
+
+  test('assisted parcours: preview, change intent + palette, then Generate', async ({ page }) => {
+    await uploadAndOpenEditor(page)
+
+    // The live preview SVG appears once the first resolve+render lands.
+    await expect(page.locator('[data-test="modal-v2-preview-svg"]')).toBeVisible({
+      timeout: 20_000,
+    })
+
+    // Generate is enabled once the pipeline reaches its terminal state.
+    const generate = page.locator('[data-test="confirm-button"]')
+    await expect(generate).toBeEnabled({ timeout: 20_000 })
+
+    // Switch the intent — Generate locks while the pipeline re-resolves,
+    // then unlocks again.
+    await page.locator('[data-test="intent-fast"]').click()
+    await expect(page.locator('[data-test="intent-fast"]')).toHaveClass(/active/)
+    await expect(generate).toBeEnabled({ timeout: 20_000 })
+
+    // Switch the palette.
+    await page.locator('[data-test="palette-free"]').click()
+    await expect(page.locator('[data-test="palette-free"]')).toHaveClass(/active/)
+    await expect(generate).toBeEnabled({ timeout: 20_000 })
+
+    // Generate closes the modal (the parent commits + tears it down).
+    await generate.click()
+    await expect(page.locator('[data-test="modal-v2-layout"]')).toBeHidden({ timeout: 20_000 })
+  })
+
+  test('expert parcours: switch to expert, see tabs, apply, generate', async ({ page }) => {
+    await uploadAndOpenEditor(page)
+    await expect(page.locator('[data-test="modal-v2-preview-svg"]')).toBeVisible({
+      timeout: 20_000,
+    })
+
+    // Flip to the expert surface from the modal header's mode toggle.
+    // Scoped to the modal backdrop so it doesn't also match the
+    // app-header toggle, which renders the same data-test ids.
+    await page
+      .locator('[data-test="modal-v2-backdrop"] [data-test="assistant-mode-expert"]')
+      .click()
+    await expect(page.locator('[data-test="modal-v2-expert-panel"]')).toBeVisible()
+    // The lazy-loaded tab strip resolves.
+    await expect(page.locator('[role="tablist"]')).toBeVisible({ timeout: 20_000 })
+
+    // Generate remains available from expert mode.
+    await expect(page.locator('[data-test="confirm-button"]')).toBeEnabled({ timeout: 20_000 })
+    await page.locator('[data-test="confirm-button"]').click()
+    // The single save button commits the expert draft through a re-upload
+    // (the draft reads dirty on a fresh expert session), and uploadSelected
+    // first asks to overwrite the existing conversion — acknowledge it.
+    await page.locator('[data-test="confirm-dialog-confirm"]').click({ timeout: 10_000 })
+    await expect(page.locator('[data-test="modal-v2-layout"]')).toBeHidden({ timeout: 20_000 })
+  })
+
+  test('Escape closes the editor when there is nothing unsaved', async ({ page }) => {
+    await uploadAndOpenEditor(page)
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-test="modal-v2-layout"]')).toBeHidden({ timeout: 10_000 })
+  })
+
+  test('first run shows the welcome tour; Escape dismisses it, not the editor', async ({
+    page,
+  }) => {
+    // Undo the beforeEach seed — this test IS the first run. Guards the
+    // exact drift that silently broke the parcours above while the e2e job
+    // was red: an overlay added over the modal body without spec coverage.
+    await page.evaluate(() => window.localStorage.removeItem('omniplot.onboarding.editorV2.v1'))
+    await uploadAndOpenEditor(page)
+    await expect(page.locator('[data-test="modal-v2-tour"]')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.locator('[data-test="modal-v2-tour"]')).toBeHidden()
+    await expect(page.locator('[data-test="modal-v2-layout"]')).toBeVisible()
+  })
+})

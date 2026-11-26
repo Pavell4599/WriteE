@@ -1,0 +1,440 @@
+// Geometry + derived rendering data for the SheetPreview (L10 #2).
+//
+// Owns the pure math + computed views the canvas + handles consume:
+//
+//   - ``workspace``: profile-derived sheet bounds + pad
+//   - ``grid``: the minor / major / cm-label grid lines
+//   - ``previewSheetRect``: the decorative format overlay from
+//     LayoutSection
+//   - ``renderedPlacements``: per-placement absolute footprint,
+//     out-of-bounds flag, sanitized SVG content + preview URL,
+//     plus the tier-selection helpers
+//   - ``snap`` / ``pxPerMm`` / ``clientToSvgMm``: coordinate helpers
+//     for the gesture layer
+//
+// Inputs are passed as refs so the composable stays decoupled from
+// the specific store + DOM tree. The orchestrator wires the live
+// ``useJobStore`` placement list + ``useUiStore`` preview sheet in;
+// future callers (tests, a standalone preview) can pass any reactive
+// source.
+
+import { computed, reactive, type Ref } from 'vue'
+import DOMPurify from 'dompurify'
+import { libraryFileOriginalUrl } from '../api/client'
+import type { MachineProfile } from '../api/client'
+import type { Placement } from '../stores/job'
+import { applyPhysicalStrokeWidth, cropSvgViewBoxToBbox, mmPerViewBoxUnit } from '../lib/penWidth'
+import type { PlanPreviewMode, PreviewSheet } from '../stores/ui'
+
+// Single source of truth for the sheet-overlay shape lives in
+// stores/ui.ts; re-exported here so existing importers keep working.
+export type { PreviewSheet }
+
+// In 'auto' mode a placement keeps its (cheap) raster preview once its
+// chosen-style SVG carries more than this many pen primitives — past
+// roughly this point an inline SVG inside a foreignObject starts to make
+// pan/zoom stutter on modest hardware (the appliance Pi), so we trade
+// the WYSIWYG vector for the flat bitmap. Tuned conservatively: simple
+// line/halftone styles stay well under it; only dense multi-pass hatching
+// trips the fallback.
+export const AUTO_SVG_PRIMITIVE_LIMIT = 5000
+
+export interface RenderedPlacement {
+  placement: Placement
+  footprint: { x_min: number; y_min: number; x_max: number; y_max: number }
+  exceeds: boolean
+  cleanSvg: string
+  /** Number of pen primitives (path / line / circle / polyline /
+   *  polygon) in ``cleanSvg``. Drives the 'auto' plan-preview heuristic
+   *  — a dense SVG keeps the cheap raster preview to protect pan/zoom
+   *  smoothness. 0 when there's no SVG yet. */
+  svgPrimitiveCount: number
+  /** URL to the original uploaded bytes, only when the file is an
+   *  image we can display directly in the browser (raster + SVG
+   *  sources). Empty for PDFs / typography / other formats — those
+   *  fall back to the plotter SVG (tier 2) immediately. */
+  previewUrl: string
+}
+
+export interface SheetWorkspace {
+  profile: MachineProfile
+  ws: MachineProfile['workspace']
+  wsW: number
+  wsH: number
+  pad: number
+}
+
+export interface SheetGrid {
+  xs: number[]
+  ys: number[]
+  majorXs: number[]
+  majorYs: number[]
+  labelsX: { x: number; cm: number }[]
+  labelsY: { y: number; cm: number }[]
+}
+
+export interface SheetGeometryInputs {
+  profile: Ref<MachineProfile | null>
+  placements: Ref<readonly Placement[]>
+  previewSheet: Ref<PreviewSheet | null>
+  /** Plan-tab rendering preference (image / svg / auto). Optional so
+   *  callers that don't care (tests, future surfaces) default to the
+   *  adaptive 'auto' behaviour. */
+  planPreviewMode?: Ref<PlanPreviewMode>
+  snapMm: Ref<number>
+  /** The container ``<div>`` whose clientWidth drives ``pxPerMm``. */
+  container: Ref<HTMLElement | null>
+  /** The SVG element whose ``getScreenCTM()`` converts client coords
+   *  into workspace mm. */
+  svgEl: Ref<SVGSVGElement | null>
+  /** Canonical-hex → pen tip width (mm) from the available-colours
+   *  inventory. When provided, each coloured group in a placement's SVG
+   *  is re-stroked to its assigned pen's physical width at display time.
+   *  Optional so standalone callers / tests can omit it. */
+  strokeWidthMm?: Ref<Map<string, number>>
+}
+
+// Count the pen-stroke primitives in an SVG string. Mirrors the
+// diagnostics counter in EditPreviewPane: each <path>/<line>/<circle>/
+// <polyline>/<polygon> is roughly one stroke, and the sum is a good
+// proxy for how expensive the SVG is to paint.
+export function countSvgPrimitives(svg: string): number {
+  if (!svg) return 0
+  // The trailing ``[\s/>]`` class matches the delimiter after the tag
+  // name — a space (``<path d=``), a self-close (``<line/>``) or a plain
+  // close (``<circle>``) — so ``<pathological>`` never counts as a path.
+  return (
+    (svg.match(/<path[\s/>]/g)?.length ?? 0) +
+    (svg.match(/<line[\s/>]/g)?.length ?? 0) +
+    (svg.match(/<circle[\s/>]/g)?.length ?? 0) +
+    (svg.match(/<polyline[\s/>]/g)?.length ?? 0) +
+    (svg.match(/<polygon[\s/>]/g)?.length ?? 0)
+  )
+}
+
+function isDisplayableMime(mime: string): boolean {
+  // Anything the browser can paint into an SVG ``<image>`` without a
+  // server-side render step. SVG counts here because we draw it
+  // through the bytes endpoint, which serves it with the right
+  // content type.
+  if (!mime) return false
+  return mime.startsWith('image/')
+}
+
+export function useSheetGeometry(inputs: SheetGeometryInputs) {
+  // DOMPurify.sanitize is expensive on large SVGs; without
+  // memoization it runs for every placement on every pointer-move
+  // during drag, which chokes the tab. Cache by placement id + raw
+  // svg so unchanged SVGs are reused across recomputations. Entries
+  // are evicted for placements that disappear from the plan.
+  const sanitizedCache = new Map<string, { svg: string; clean: string; count: number }>()
+
+  // Per-library-file load status for the source-preview image.
+  // ``reactive`` so onload / onerror on the SVG ``<image>`` re-trigger
+  // the template without recomputing the heavy
+  // ``renderedPlacements`` chain.
+  type PreviewStatus = 'loading' | 'loaded' | 'failed'
+  const previewStatus = reactive<Record<string, PreviewStatus>>({})
+
+  function onPreviewLoad(fileId: string): void {
+    previewStatus[fileId] = 'loaded'
+  }
+  function onPreviewError(fileId: string): void {
+    previewStatus[fileId] = 'failed'
+  }
+
+  const workspace = computed<SheetWorkspace | null>(() => {
+    const profile = inputs.profile.value
+    if (!profile) return null
+    const ws = profile.workspace
+    const wsW = ws.x_max - ws.x_min
+    const wsH = ws.y_max - ws.y_min
+    if (wsW <= 0 || wsH <= 0) return null
+    const pad = Math.max(wsW, wsH) * 0.04
+    return { profile, ws, wsW, wsH, pad }
+  })
+
+  // Stroke-width restyle cache: keyed by the sanitized input SVG + scale
+  // + inventory signature so resizing a placement (new scale), editing a
+  // pen width (new signature) OR a /rerender that swaps the SVG at the
+  // same size all recompute, but an unchanged frame reuses the parsed
+  // result instead of re-running DOMParser on every pointer-move. The
+  // ``svgIn`` identity check mirrors the crop cache below — without it a
+  // /rerender with identical size + inventory kept serving the stale
+  // styled output (and then the stale crop), so the canvas showed the
+  // pre-rerender drawing whenever stroke widths existed.
+  const styledCache = new Map<string, { svgIn: string; key: string; out: string }>()
+
+  // Crop cache: ``cropSvgViewBoxToBbox`` is a string-replace but it runs
+  // for every placement on every reactive tick of ``renderedPlacements``.
+  // During a drag that's once per frame × N placements, on potentially
+  // large SVGs. Cache by placement id + the inputs that change the
+  // output: the post-style SVG and the bbox identity. Both are stable
+  // during move/resize gestures, so the cached entry hits every frame.
+  const cropCache = new Map<string, { svgIn: string; bboxKey: string; out: string }>()
+
+  const renderedPlacements = computed<RenderedPlacement[]>(() => {
+    const w = workspace.value
+    if (!w) return []
+    const widthMap = inputs.strokeWidthMm?.value ?? null
+    // Compact signature of the inventory widths so the styled cache busts
+    // when the operator changes a pen tip width.
+    const mapSig = widthMap ? [...widthMap.entries()].map(([h, mm]) => `${h}:${mm}`).join(',') : ''
+    const seen = new Set<string>()
+    const out = inputs.placements.value.map((p) => {
+      seen.add(p.id)
+      const x_min = w.ws.x_min + p.x_mm
+      const y_min = w.ws.y_min + p.y_mm
+      const x_max = x_min + p.width_mm
+      const y_max = y_min + p.height_mm
+      const exceeds =
+        x_min < w.ws.x_min - 0.01 ||
+        y_min < w.ws.y_min - 0.01 ||
+        x_max > w.ws.x_max + 0.01 ||
+        y_max > w.ws.y_max + 0.01
+      let cleanSvg = ''
+      let svgPrimitiveCount = 0
+      if (p.svg) {
+        const cached = sanitizedCache.get(p.id)
+        if (cached && cached.svg === p.svg) {
+          cleanSvg = cached.clean
+          svgPrimitiveCount = cached.count
+        } else {
+          cleanSvg = DOMPurify.sanitize(p.svg, {
+            USE_PROFILES: { svg: true, svgFilters: true },
+          })
+          // Count once at sanitize time and cache alongside the clean
+          // SVG — the 'auto' heuristic reads it on every pointer-move
+          // during drag, so it must not re-scan the string each frame.
+          svgPrimitiveCount = countSvgPrimitives(cleanSvg)
+          sanitizedCache.set(p.id, { svg: p.svg, clean: cleanSvg, count: svgPrimitiveCount })
+        }
+        // Re-stroke each coloured group at its assigned pen's physical
+        // width. Applied to the sanitised SVG (post-DOMPurify) so the
+        // operator sees a true-to-life line thickness in the preview.
+        if (widthMap && widthMap.size) {
+          const mmPerUnit = mmPerViewBoxUnit(cleanSvg, p.width_mm, p.height_mm)
+          if (mmPerUnit) {
+            // Quantize mmPerUnit to 3 decimals (≈ 0.001 mm/unit) so a
+            // resize drag spanning hundreds of intermediate scales
+            // collapses to a handful of cache slots. DOMParser +
+            // querySelectorAll + serialize on a large SVG can take
+            // 5–20 ms; without this, every pointer-move during a
+            // resize re-ran them. The quantisation error is well
+            // below the operator's perceivable line-thickness
+            // threshold.
+            const key = `${mmPerUnit.toFixed(3)}|${mapSig}`
+            const cached = styledCache.get(p.id)
+            if (cached && cached.svgIn === cleanSvg && cached.key === key) {
+              cleanSvg = cached.out
+            } else {
+              const styled = applyPhysicalStrokeWidth(cleanSvg, widthMap, mmPerUnit)
+              styledCache.set(p.id, { svgIn: cleanSvg, key, out: styled })
+              cleanSvg = styled
+            }
+          }
+        }
+        // Crop the rendered SVG's viewBox to the actual inked content
+        // bbox. Text / PDF / HTML converters emit a page-sized viewBox
+        // with the content offset by the page margins; without this
+        // crop, those margins surface as empty space at the top-left of
+        // the on-sheet placement and any glyph past the placement's
+        // footprint is clipped on the bottom-right.
+        const bbox = p.source_bbox
+        if (bbox && bbox.x_max > bbox.x_min && bbox.y_max > bbox.y_min) {
+          // The crop output depends only on the post-style SVG and the
+          // bbox identity — both stable across move/resize frames — so
+          // the cache hits every drag tick once primed. The previous
+          // implementation re-ran the regex for every placement on
+          // every reactive recompute (= N placements × every frame).
+          const bboxKey = `${bbox.x_min}|${bbox.y_min}|${bbox.x_max}|${bbox.y_max}`
+          const cached = cropCache.get(p.id)
+          if (cached && cached.svgIn === cleanSvg && cached.bboxKey === bboxKey) {
+            cleanSvg = cached.out
+          } else {
+            const cropped = cropSvgViewBoxToBbox(cleanSvg, bbox)
+            cropCache.set(p.id, { svgIn: cleanSvg, bboxKey, out: cropped })
+            cleanSvg = cropped
+          }
+        }
+      } else {
+        sanitizedCache.delete(p.id)
+        styledCache.delete(p.id)
+        cropCache.delete(p.id)
+      }
+      // Tier 1 source preview is only attempted when (a) we have a
+      // library entry to read bytes from, and (b) the MIME is one
+      // the browser can paint without an extra server-side render
+      // step.
+      const previewUrl =
+        p.library_file_id && isDisplayableMime(p.source_mime)
+          ? libraryFileOriginalUrl(p.library_file_id)
+          : ''
+      return {
+        placement: p,
+        footprint: { x_min, y_min, x_max, y_max },
+        exceeds,
+        cleanSvg,
+        svgPrimitiveCount,
+        previewUrl,
+      }
+    })
+    for (const id of sanitizedCache.keys()) {
+      if (!seen.has(id)) sanitizedCache.delete(id)
+    }
+    for (const id of styledCache.keys()) {
+      if (!seen.has(id)) styledCache.delete(id)
+    }
+    for (const id of cropCache.keys()) {
+      if (!seen.has(id)) cropCache.delete(id)
+    }
+    return out
+  })
+
+  /** Pick exactly one layer to paint for this placement, honouring the
+   *  operator's plan-preview preference. Mutually exclusive by design —
+   *  the canvas must never double-paint (raster on top of SVG, or the
+   *  reverse) because the two layers occupy the same footprint and the
+   *  bottom one flickers through whenever the top one is still decoding,
+   *  fails to load, or has transparency. Each placement picks its layer
+   *  independently, but the rule for any given (mode, availability) pair
+   *  is deterministic so the whole plan stays visually consistent.
+   *
+   *  Decision table (✓ = picked, — = skipped, ↘ = fallback):
+   *    mode    cleanSvg  rasterUsable    picked
+   *    image      —           ✓          image
+   *    image      ✓           ✓          image
+   *    image      ✓           —          svg   ↘ (raster unavailable)
+   *    image      —           —          badge
+   *    svg        ✓           ✓          svg
+   *    svg        ✓           —          svg
+   *    svg        —           ✓          image ↘ (no SVG yet)
+   *    svg        —           —          badge
+   *    auto       light       ✓          svg   (WYSIWYG when cheap)
+   *    auto       light       —          svg
+   *    auto       heavy       ✓          image (protect pan/zoom)
+   *    auto       heavy       —          svg   ↘ (no raster, accept cost)
+   *    auto       —           ✓          image
+   *    auto       —           —          badge */
+  function chooseLayer(rp: RenderedPlacement): 'image' | 'svg' | 'badge' {
+    const mode = inputs.planPreviewMode?.value ?? 'auto'
+    const hasSvg = !!rp.cleanSvg
+    const status = rp.previewUrl ? previewStatus[rp.placement.library_file_id ?? ''] : undefined
+    const rasterUsable = !!rp.previewUrl && status !== 'failed'
+    if (mode === 'image') {
+      if (rasterUsable) return 'image'
+      if (hasSvg) return 'svg'
+      return 'badge'
+    }
+    if (mode === 'svg') {
+      if (hasSvg) return 'svg'
+      if (rasterUsable) return 'image'
+      return 'badge'
+    }
+    // 'auto': WYSIWYG vector unless it's dense enough to risk laggy
+    // pan/zoom, in which case keep the cheap raster. Fall through to the
+    // SVG when there is no raster to fall back to.
+    if (hasSvg && rp.svgPrimitiveCount <= AUTO_SVG_PRIMITIVE_LIMIT) return 'svg'
+    if (rasterUsable) return 'image'
+    if (hasSvg) return 'svg'
+    return 'badge'
+  }
+
+  function showsPreviewImage(rp: RenderedPlacement): boolean {
+    return chooseLayer(rp) === 'image'
+  }
+
+  function showsPlotterSvg(rp: RenderedPlacement): boolean {
+    return chooseLayer(rp) === 'svg'
+  }
+
+  function showsMimeBadge(rp: RenderedPlacement): boolean {
+    return chooseLayer(rp) === 'badge'
+  }
+
+  const anyExceeds = computed(() => renderedPlacements.value.some((r) => r.exceeds))
+
+  // Sheet overlay shown when the user picked a sheet format in
+  // LayoutSection. Anchored at the workspace top-left, clipped to
+  // the workspace bounds, and purely decorative — no impact on
+  // placement logic.
+  const previewSheetRect = computed(() => {
+    const w = workspace.value
+    const sheet = inputs.previewSheet.value
+    if (!w || !sheet) return null
+    const offX = Math.max(0, Math.min(sheet.x_mm ?? 0, w.wsW))
+    const offY = Math.max(0, Math.min(sheet.y_mm ?? 0, w.wsH))
+    // Clip the overlay to the remaining workspace so an offset sheet that
+    // would overflow stays inside the drawn bed.
+    const width = Math.max(0, Math.min(sheet.width_mm, w.wsW - offX))
+    const height = Math.max(0, Math.min(sheet.height_mm, w.wsH - offY))
+    if (width <= 0 || height <= 0) return null
+    return { x: w.ws.x_min + offX, y: w.ws.y_min + offY, width, height }
+  })
+
+  // Grid: minor lines every 10 mm (1 cm), major every 50 mm (5 cm).
+  const grid = computed<SheetGrid | null>(() => {
+    const w = workspace.value
+    if (!w) return null
+    const xs: number[] = []
+    const ys: number[] = []
+    const majorXs: number[] = []
+    const majorYs: number[] = []
+    const labelsX: { x: number; cm: number }[] = []
+    const labelsY: { y: number; cm: number }[] = []
+    for (let x = Math.ceil(w.ws.x_min / 10) * 10; x <= w.ws.x_max + 0.0001; x += 10) {
+      xs.push(x)
+      if (Math.round(x) % 50 === 0) {
+        majorXs.push(x)
+        labelsX.push({ x, cm: Math.round(x / 10) })
+      }
+    }
+    for (let y = Math.ceil(w.ws.y_min / 10) * 10; y <= w.ws.y_max + 0.0001; y += 10) {
+      ys.push(y)
+      if (Math.round(y) % 50 === 0) {
+        majorYs.push(y)
+        labelsY.push({ y, cm: Math.round(y / 10) })
+      }
+    }
+    return { xs, ys, majorXs, majorYs, labelsX, labelsY }
+  })
+
+  function snap(value: number): number {
+    if (inputs.snapMm.value <= 0) return value
+    return Math.round(value / inputs.snapMm.value) * inputs.snapMm.value
+  }
+
+  function pxPerMm(): number {
+    const w = workspace.value
+    if (!w || !inputs.container.value) return 1
+    return inputs.container.value.clientWidth / (w.wsW + 2 * w.pad)
+  }
+
+  function clientToSvgMm(clientX: number, clientY: number): { x: number; y: number } | null {
+    const svg = inputs.svgEl.value
+    if (!svg) return null
+    const pt = svg.createSVGPoint()
+    pt.x = clientX
+    pt.y = clientY
+    const ctm = svg.getScreenCTM()
+    if (!ctm) return null
+    const local = pt.matrixTransform(ctm.inverse())
+    return { x: local.x, y: local.y }
+  }
+
+  return {
+    workspace,
+    renderedPlacements,
+    grid,
+    previewSheetRect,
+    anyExceeds,
+    snap,
+    pxPerMm,
+    clientToSvgMm,
+    showsPreviewImage,
+    showsPlotterSvg,
+    showsMimeBadge,
+    onPreviewLoad,
+    onPreviewError,
+  }
+}

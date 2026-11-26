@@ -1,0 +1,346 @@
+"""Rebuild a G-code program so a job can resume after an interruption.
+
+Streaming records how many executable lines were acknowledged. To resume from
+that checkpoint safely we cannot simply continue mid-stream: G-code is modal, so
+units, absolute/relative mode, the head position and the pen state must be
+re-established first. This module replays the executed prefix to recover that
+modal state, then emits a small preamble (restore units/positioning, lift the
+pen, travel back to the last position, re-lower the pen if the checkpoint fell
+mid-stroke) followed by the remaining lines.
+
+Two limits worth stating plainly:
+
+* **Checkpoint granularity.** The streamer persists a checkpoint at most every
+  ~50 acknowledged lines / 2 s (plus on every pause / swap / error boundary),
+  so an unclean stop can lose up to that many lines — resume replays from the
+  last *checkpoint*, not the last physical stroke, and may retrace a short
+  already-drawn section. Callers should describe resume as "from the last
+  checkpoint", never "from the exact interruption point". A firmware ``ok`` is
+  *accepted*, not *executed*, so after a power loss the head can sit several
+  buffered moves behind the checkpoint. ``OMNIPLOT_RESUME_CONSERVATIVE=1``
+  rewinds the resume point to the last pen-up boundary so those unexecuted
+  moves are re-drawn rather than skipped (a little over-draw instead of a gap);
+  it is opt-in because it changes the default no-over-draw behaviour, and the
+  fully robust fix (checkpoint only on ``M400`` / ``Idle`` confirmation) needs
+  per-firmware validation on real hardware.
+* **EBB is partial.** This reconstruction reads absolute X/Y from the executed
+  prefix. An EBB program is a stream of *relative* ``SM`` step moves with no
+  absolute coordinates, so the head position cannot be recovered this way;
+  resuming an interrupted EBB job may misregister and should be treated as
+  best-effort until a native EBB resume path exists.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+from pen_plotter.hardware.commands import goto_command
+from pen_plotter.hardware.streamer import executable_lines
+from pen_plotter.models import MachineProfile
+
+
+@dataclass
+class _ModalState:
+    """Modal G-code state recovered from an executed prefix."""
+
+    x: float | None = None
+    y: float | None = None
+    units: str | None = None  # "G20" or "G21"
+    absolute: bool = True
+    # The pen-down command last seen, verbatim, when the pen was left DOWN
+    # at the checkpoint — ``None`` when the pen is up (or no pen command
+    # appeared in the prefix). Kept as the exact line so a per-slot
+    # calibration override (``PenSlot.pen_down_command``) is replayed
+    # unchanged instead of being replaced by the profile default.
+    pen_down_line: str | None = None
+    # Pen-up command for the *currently loaded* pen — the calibrated up line of
+    # whichever pen the last pen-down belonged to. The resume preamble lifts
+    # the pen with this before travelling back, so a per-slot ``pen_up_command``
+    # override isn't clobbered by the profile default. ``None`` ⇒ no pen seen
+    # yet, fall back to the profile default.
+    active_pen_up_line: str | None = None
+    # Last modal feedrate (``F`` word) seen in the executed prefix, in the
+    # program's own units-per-minute. ``F`` is modal, so a program can set it
+    # once and draw many moves without restating it. The resume travel-back
+    # emits its own *travel* ``F``; restoring this before the remainder keeps a
+    # mid-stroke resume from drawing the rest of the path at travel speed.
+    # ``None`` ⇒ no feed seen yet.
+    feed: float | None = None
+
+
+def _coord(token: str) -> float | None:
+    try:
+        return float(token[1:])
+    except ValueError:
+        return None
+
+
+def _pen_command_sets(profile: MachineProfile) -> tuple[set[str], set[str]]:
+    """Return ``(pen_up_lines, pen_down_lines)`` the profile can emit.
+
+    Generated programs write the profile's ``pen_up_command`` /
+    ``pen_down_command`` verbatim, or a per-slot override when the pen's
+    calibration sets one — collect them all so the replay recognises
+    every variant.
+    """
+    ups = {profile.pen_up_command.strip()}
+    downs = {profile.pen_down_command.strip()}
+    for pen in profile.effective_pens():
+        if pen.pen_up_command:
+            ups.add(pen.pen_up_command.strip())
+        if pen.pen_down_command:
+            downs.add(pen.pen_down_command.strip())
+    ups.discard("")
+    downs.discard("")
+    return ups, downs
+
+
+def _pen_up_by_down(profile: MachineProfile) -> dict[str, str]:
+    """Map each pen's effective pen-down line to its effective pen-up line.
+
+    The executed prefix has no tool-change comments (they're stripped), so the
+    only in-band signal of which pen is loaded is the pen-down command itself.
+    A per-slot calibration that overrides ``pen_down_command`` yields a unique
+    down line, letting the resume replay recover *that* pen's ``pen_up_command``
+    rather than lifting with the profile default.
+    """
+    # A down command is only a reliable signal of the loaded pen when it maps to
+    # exactly one up command. If two slots share a down command but differ in
+    # their up command, the down line is ambiguous, so fall back to the profile
+    # default up for it rather than picking an arbitrary slot's override (P2.4).
+    candidates: dict[str, set[str]] = {}
+    for pen in profile.effective_pens():
+        down = (pen.pen_down_command or profile.pen_down_command).strip()
+        up = (pen.pen_up_command or profile.pen_up_command).strip()
+        if down and up:
+            candidates.setdefault(down, set()).add(up)
+    default_up = profile.pen_up_command.strip()
+    return {
+        down: next(iter(ups)) if len(ups) == 1 else default_up
+        for down, ups in candidates.items()
+    }
+
+
+# Draw/travel moves whose X/Y words define the head's new position. Arcs
+# (G2/G3) end at their X/Y just like a line, so their endpoint must advance the
+# replayed position — omitting them left the checkpoint position stuck before
+# the last arc and could send the head back to the wrong point on resume (P0.4).
+_MOVE_CODES = ("G0", "G1", "G2", "G3", "G00", "G01", "G02", "G03")
+
+
+def _replay(
+    lines: list[str],
+    pen_ups: set[str],
+    pen_downs: set[str],
+    pen_up_by_down: dict[str, str],
+) -> _ModalState:
+    """Recover modal state by scanning already-executed command lines."""
+    state = _ModalState()
+    for line in lines:
+        if line in pen_downs:
+            state.pen_down_line = line
+            # Remember the loaded pen's up line so travel lifts correctly.
+            state.active_pen_up_line = pen_up_by_down.get(line, state.active_pen_up_line)
+            continue
+        if line in pen_ups:
+            state.pen_down_line = None
+            continue
+        tokens = line.split()
+        if not tokens:
+            continue
+        code = tokens[0]
+        if code in ("G20", "G21"):
+            state.units = code
+            continue
+        if code == "G90":
+            state.absolute = True
+            continue
+        if code == "G91":
+            state.absolute = False
+            continue
+        if code[:1] == "F":
+            # A standalone modal feed line (``F1500``) with no motion word.
+            value = _coord(code)
+            if value is not None:
+                state.feed = value
+            continue
+        if code not in _MOVE_CODES:
+            continue
+        for token in tokens[1:]:
+            if token[:1] == "X":
+                value = _coord(token)
+                if value is not None:
+                    state.x = value if state.absolute else (state.x or 0.0) + value
+            elif token[:1] == "Y":
+                value = _coord(token)
+                if value is not None:
+                    state.y = value if state.absolute else (state.y or 0.0) + value
+            elif token[:1] == "F":
+                value = _coord(token)
+                if value is not None:
+                    state.feed = value
+    return state
+
+
+def _starts_with_draw_move(remainder: list[str]) -> bool:
+    """Whether the first remaining line is a drawing move (G1/G2/G3).
+
+    Generated programs travel with G0 and draw with G1/G2/G3, so a
+    remainder opening on a draw move means the checkpoint fell
+    mid-stroke. When it opens on anything else (a pen-up, a travel, a
+    tool change) the program re-establishes its own pen state and
+    re-lowering the pen first would only stamp a stray dot at the
+    resume point.
+    """
+    if not remainder:
+        return False
+    code = remainder[0].split()[0] if remainder[0].split() else ""
+    return code in ("G1", "G01", "G2", "G02", "G3", "G03")
+
+
+def _remainder_relies_on_modal_feed(remainder: list[str]) -> bool:
+    """Whether the remainder's first drawing move inherits the modal feed.
+
+    ``F`` is modal: after the resume travel-back (which emits the *travel*
+    feed) a program that draws G1/G2/G3 without restating ``F`` would run the
+    rest of the interrupted path at travel speed. Returns True only when the
+    first feed-relevant line is a draw with no ``F`` word — so programs that
+    restate their feed (every OmniPlot-generated program does) are untouched.
+    """
+    draw_codes = ("G1", "G01", "G2", "G02", "G3", "G03")
+    for line in remainder:
+        tokens = line.split()
+        if not tokens:
+            continue
+        if any(token[:1] == "F" for token in tokens):
+            return False  # feed restated before/at the first draw
+        if tokens[0] in draw_codes:
+            return True  # draws without an F → inherits the (travel) modal feed
+    return False
+
+
+def _resume_conservative() -> bool:
+    """Whether to rewind the resume point to the last pen-up boundary (P0.1).
+
+    Default **on**: a firmware ``ok`` is *accepted*, not *executed*, so resuming
+    exactly at the checkpoint can skip moves that were acknowledged but never
+    physically drawn — a permanent gap, which is worse than a little over-draw.
+    Set ``OMNIPLOT_RESUME_CONSERVATIVE=0`` to opt back into exact-checkpoint
+    resume (only safe once checkpoints are confirmed by firmware ``Idle`` /
+    ``M400``, which needs per-controller hardware validation).
+    """
+    raw = os.environ.get("OMNIPLOT_RESUME_CONSERVATIVE")
+    if raw is None or not raw.strip():
+        return True  # default: never leave a gap
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rewind_to_pen_up(
+    lines: list[str], checkpoint: int, pen_ups: set[str], tool_change_command: str
+) -> int:
+    """Index of the last pen-up command at or before ``checkpoint`` (else 0).
+
+    A firmware ``ok`` means *accepted*, not *executed*: on power loss the head
+    may sit several buffered moves behind the checkpoint. Restarting from the
+    last point where the pen was UP re-draws the interrupted stroke instead of
+    skipping the moves that were acknowledged but never physically drawn —
+    trading a little over-draw (harmless on a pen plot) for never leaving a gap.
+
+    The backward scan stops at a completed tool-change boundary (the firmware
+    pause command staged at every swap). Rewinding *past* a swap the operator
+    has already confirmed would redraw the previous layer with the newly loaded
+    pen (wrong colour) and re-emit the swap's ``M0`` as a raw firmware pause
+    (the queue filters guided pauses on the original checkpoint, so the crossed
+    one is dropped). When a tool change sits between the checkpoint and the last
+    pen-up, resume from just after that swap instead (P0.5).
+    """
+    boundary = tool_change_command.strip()
+    for i in range(checkpoint - 1, -1, -1):
+        if boundary and lines[i] == boundary:
+            return i + 1
+        if lines[i] in pen_ups:
+            return i
+    return 0
+
+
+def build_resume_program(gcode: str, acked_lines: int, profile: MachineProfile) -> list[str]:
+    """Build the executable line list needed to resume a job from a checkpoint.
+
+    Args:
+        gcode: The full original G-code program.
+        acked_lines: Number of executable lines already acknowledged.
+        profile: Target machine profile (for pen-up and travel speed).
+
+    Returns:
+        Executable command lines: a re-initialization preamble followed by the
+        not-yet-sent lines. Resuming from the start returns the full program
+        unchanged; resuming past the end returns an empty list.
+
+    With ``OMNIPLOT_RESUME_CONSERVATIVE=1`` the resume point is rewound to the
+    last pen-up boundary at or before the checkpoint, so an acknowledged-but-
+    unexecuted move at power-loss is re-drawn rather than skipped (P0.3).
+    """
+    lines = executable_lines(gcode)
+    checkpoint = max(0, min(acked_lines, len(lines)))
+    if checkpoint == 0 or checkpoint >= len(lines):
+        # Past the end → nothing to resume; at the start → full program.
+        return [] if checkpoint >= len(lines) and checkpoint else lines
+
+    pen_ups, pen_downs = _pen_command_sets(profile)
+    if _resume_conservative():
+        checkpoint = _rewind_to_pen_up(
+            lines, checkpoint, pen_ups, profile.tool_change_command
+        )
+        if checkpoint == 0:
+            return lines  # rewound all the way back → replot from the start
+    remainder = lines[checkpoint:]
+    pen_up_by_down = _pen_up_by_down(profile)
+    state = _replay(lines[:checkpoint], pen_ups, pen_downs, pen_up_by_down)
+    preamble: list[str] = []
+    # ``goto_command`` emits metric coordinates and an mm/min feed. If the job
+    # is running in inches (``G20``), the firmware would read those as
+    # inches — travelling to the wrong spot at ~25.4× the feed (P2.3). So the
+    # re-init travel is always done in ``G21`` with the recovered position
+    # converted to mm, then the job's real units are restored before the
+    # remainder runs.
+    inch_mode = state.units == "G20"
+    scale = 25.4 if inch_mode else 1.0
+    travel_units = "G21" if inch_mode else state.units
+    if travel_units:
+        preamble.append(travel_units)
+    if state.x is not None and state.y is not None:
+        # goto_command asserts G90, lifts the pen, and travels to the position.
+        # Lift with the loaded pen's own up command so a per-slot override is
+        # honoured — otherwise the pen may not actually clear the paper on the
+        # travel back to the checkpoint (P0.4).
+        preamble.extend(
+            goto_command(
+                state.x * scale,
+                state.y * scale,
+                profile,
+                pen_up_command=state.active_pen_up_line,
+            )
+        )
+        # The checkpoint fell mid-stroke (pen was down, the next line keeps
+        # drawing): re-lower the pen so the rest of the interrupted path is
+        # actually inked instead of being air-drawn until the next pen-down.
+        if state.pen_down_line is not None and _starts_with_draw_move(remainder):
+            preamble.append(state.pen_down_line)
+    else:
+        preamble.append("G90")
+    # Restore the job's real units (only when we overrode them for the travel).
+    if inch_mode:
+        preamble.append("G20")
+    if not state.absolute:
+        preamble.append("G91")
+    # Re-establish the modal feed the checkpoint was drawing at. The firmware
+    # lost its modal state on the interruption and ``goto_command`` above just
+    # set the *travel* feed, so a remainder that keeps drawing without
+    # restating ``F`` would otherwise finish the interrupted path at travel
+    # speed (potentially ~24× too fast → skipped steps / ruined strokes).
+    # Emitted after the units are restored so ``F`` is in the job's own units,
+    # and only when the remainder actually inherits the modal feed.
+    if state.feed is not None and _remainder_relies_on_modal_feed(remainder):
+        preamble.append(f"F{state.feed:g}")
+    return preamble + remainder

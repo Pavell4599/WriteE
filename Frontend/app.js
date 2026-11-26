@@ -9,6 +9,7 @@ const progress = document.querySelector("#progress");
 const progressBars = [...document.querySelectorAll(".progress span")];
 const stepCount = document.querySelector("#step-count");
 const sourceFile = document.querySelector("#source-file");
+const traceMode = document.querySelector("#trace-mode");
 const prompt = document.querySelector("#prompt");
 const promptFiles = document.querySelector("#prompt-files");
 const fileRow = document.querySelector("#file-row");
@@ -29,6 +30,7 @@ const servoUpInput = document.querySelector("#servo-up");
 const servoDownInput = document.querySelector("#servo-down");
 const servoDelayInput = document.querySelector("#servo-delay");
 const servoCalibrated = document.querySelector("#servo-calibrated");
+const traceThreshold = document.querySelector("#trace-threshold");
 let currentStep = 0;
 let attachments = [];
 let currentSvg = "";
@@ -36,6 +38,7 @@ let currentGcode = "";
 let currentJobId = "";
 let previewUrl = "";
 let fluidNcReady = false;
+let preflightTimer = null;
 
 function showMenu() {
   mainMenu.hidden = false;
@@ -137,6 +140,9 @@ function updateAttachments(files) {
 async function postImageForSvg(file) {
   const formData = new FormData();
   formData.append("file", file, file.name);
+  formData.append("mode", traceMode.value);
+  const threshold = thresholdValue();
+  if (threshold !== null) formData.append("threshold", String(threshold));
   const response = await fetch("/api/vectorize", { method: "POST", body: formData });
   return readJson(response);
 }
@@ -178,6 +184,7 @@ async function prepareSvg() {
     document.querySelector("#svg-preview").hidden = false;
     document.querySelector("#svg-empty").hidden = true;
     showStep(1);
+    schedulePreflight();
   } catch (error) {
     showError(inputError, error.message);
   } finally {
@@ -291,6 +298,56 @@ async function sendGcode() {
   }
 }
 
+function thresholdValue() {
+  if (traceThreshold.value === "0") return null;
+  return Number(traceThreshold.value);
+}
+
+async function runPreflight() {
+  if (!currentSvg) return;
+  const preflight = document.querySelector("#preflight");
+  preflight.classList.add("loading");
+  preflight.innerHTML = '<span class="preflight-status">РАСЧЁТ…</span>';
+  const value = (name) => Number(projectForm.elements.namedItem(name).value);
+  try {
+    const response = await fetch("/api/preflight", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        svg: currentSvg,
+        bed_width_mm: value("bed_width_mm"), bed_height_mm: value("bed_height_mm"),
+        speed_mm_s: value("speed_mm_s"), pen_mode: penLiftMode.value,
+        z_up_mm: value("z_up_mm"), z_down_mm: value("z_down_mm"),
+        servo_up_s: Number(servoUpInput.value), servo_down_s: Number(servoDownInput.value),
+        servo_delay_ms: Number(servoDelayInput.value),
+        offset_x_percent: value("offset_x_percent"), offset_y_percent: value("offset_y_percent"),
+      }),
+    });
+    const result = await readJson(response);
+    const metrics = result;
+    const time = metrics.estimated_seconds < 60
+      ? `${metrics.estimated_seconds} СЕК`
+      : `${Math.round(metrics.estimated_seconds / 60)} МИН`;
+    preflight.classList.toggle("has-warning", Boolean(metrics.warnings?.length));
+    preflight.innerHTML = `
+      <div><span>ДЛИНА ЛИНИИ</span><strong>${metrics.drawing_length_mm} ММ</strong></div>
+      <div><span>ХОЛОСТЫЕ ХОДЫ</span><strong>${metrics.travel_length_mm} ММ</strong></div>
+      <div><span>ВРЕМЯ ПРИБЛ.</span><strong>${time}</strong></div>
+      <div><span>КОМАНД</span><strong>${metrics.line_count}</strong></div>
+      ${metrics.warnings?.map((warning) => `<p class="preflight-warning">${warning}</p>`).join("") || '<p class="preflight-ready">ПРЕДПОЛЁТНАЯ ПРОВЕРКА ПРОЙДЕНА</p>'}`;
+  } catch (error) {
+    preflight.classList.add("has-warning");
+    preflight.innerHTML = `<p class="preflight-warning">${error.message}</p>`;
+  } finally {
+    preflight.classList.remove("loading");
+  }
+}
+
+function schedulePreflight() {
+  clearTimeout(preflightTimer);
+  preflightTimer = setTimeout(runPreflight, 180);
+}
+
 document.querySelector("[data-start]").addEventListener("click", () => showStep(0));
 document.querySelector("[data-menu]").addEventListener("click", showMenu);
 document.querySelectorAll("[data-back]").forEach((button) => {
@@ -312,6 +369,7 @@ penLiftMode.addEventListener("change", () => {
   servoCalibrated.checked = false;
   currentJobId = "";
   refreshSendButton();
+  schedulePreflight();
 });
 document.querySelectorAll("#screen-svg .settings input:not(#servo-calibrated), #screen-svg .settings select").forEach((input) => {
   input.addEventListener("input", () => {
@@ -320,6 +378,7 @@ document.querySelectorAll("#screen-svg .settings input:not(#servo-calibrated), #
       servoCalibrated.checked = false;
     }
     refreshSendButton();
+    schedulePreflight();
   });
 });
 servoCalibrated.addEventListener("change", refreshSendButton);
@@ -375,5 +434,19 @@ document.querySelector("#download-gcode").addEventListener("click", () => {
 
 hostInput.value = localStorage.getItem("fluidnc-host") || "";
 window.addEventListener("beforeunload", () => {
-  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  if (currentGcode) {
+    const blob = new Blob([currentGcode], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "drawing.gcode";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
 });
+
+traceThreshold.addEventListener("input", () => {
+  document.querySelector("#threshold-value").textContent = traceThreshold.value === "0" ? "АВТО" : Number(traceThreshold.value).toFixed(2);
+});
+
+traceMode.addEventListener("change", schedulePreflight);
